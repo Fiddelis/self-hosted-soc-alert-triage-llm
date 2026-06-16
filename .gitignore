@@ -13,5 +13,7 @@ wheels/
 data/*.jsonl
 data/checkpoints/
 runs/
-dataset/
+dataset/*
+!dataset/*.jsonl
+!dataset/**/*.jsonl
 *.DS_Store
