@@ -16,4 +16,6 @@ runs/
 dataset/*
 !dataset/*.jsonl
 !dataset/**/*.jsonl
+!dataset/processed/
+!dataset/processed/**
 *.DS_Store
