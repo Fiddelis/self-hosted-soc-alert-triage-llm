@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import shutil
 import sys
 import time
@@ -33,8 +34,10 @@ from comiset_extract import (
 )
 from comiset.checkpoint import load_checkpoint, save_checkpoint
 from comiset.metrics import (
+    classify_report,
     collect_filter_metrics,
     empty_filter_totals,
+    filter_report,
     filter_metrics_summary,
     load_filter_metrics,
     update_filter_metrics,
@@ -53,6 +56,9 @@ from comiset.records import (
 from comiset.responses import parse_json_response
 
 
+LOGGER = logging.getLogger("comiset.pipeline")
+
+
 def filter_prompt(record: dict[str, Any], prompt_format: str) -> str:
     payload = record_to_prompt_payload(record, prompt_format)
     return (
@@ -65,6 +71,31 @@ def filter_prompt(record: dict[str, Any], prompt_format: str) -> str:
 
 
 def filter_records(args: argparse.Namespace) -> None:
+    gateway = OllamaGateway(
+        args.ollama_url,
+        pull_missing=args.pull_missing,
+        timeout_seconds=args.timeout_seconds,
+        logger=LOGGER,
+    )
+    try:
+        _filter_records(args, gateway)
+    finally:
+        cleanup_model_after_use(args, gateway, args.model)
+
+
+def cleanup_model_after_use(args: argparse.Namespace, gateway: OllamaGateway, model: str) -> None:
+    if not getattr(args, "delete_model_after_use", False):
+        return
+    try:
+        deleted = gateway.delete_ready_model(model)
+    except Exception as exc:
+        LOGGER.warning("Failed to delete Ollama model %r: %s", model, exc)
+        return
+    if deleted:
+        LOGGER.info("Deleted Ollama model %r after use.", model)
+
+
+def _filter_records(args: argparse.Namespace, gateway: OllamaGateway) -> None:
     input_path = Path(args.input)
     output_path = Path(args.output)
     checkpoint_path = Path(args.checkpoint) if args.checkpoint else None
@@ -75,10 +106,9 @@ def filter_records(args: argparse.Namespace) -> None:
     checkpoint = load_checkpoint(checkpoint_path)
 
     if args.resume and checkpoint.get("phase") == "done":
+        LOGGER.info("Filter checkpoint already done: %s", checkpoint_path)
         print(json.dumps(checkpoint, indent=2))
         return
-
-    gateway = OllamaGateway(args.ollama_url, pull_missing=args.pull_missing, timeout_seconds=args.timeout_seconds)
 
     resume_line = int(checkpoint.get("input_line", 0)) if args.resume else 0
     processed = int(checkpoint.get("processed", 0)) if args.resume and output_path.exists() else 0
@@ -158,18 +188,17 @@ def filter_records(args: argparse.Namespace) -> None:
             "metric_totals": totals,
         },
     )
-    print(
-        json.dumps(
-            {
-                **filter_metrics_summary(totals, len(by_segment)),
-                "processed": processed,
-                "output": str(output_path),
-                "metrics": str(metrics_path),
-                "metrics_by_segment": str(metrics_by_segment_path),
-            },
-            indent=2,
-        )
-    )
+    report_paths = generate_filter_report(output_path, output_path.parent)
+    summary = {
+        **filter_metrics_summary(totals, len(by_segment)),
+        "processed": processed,
+        "output": str(output_path),
+        "metrics": str(metrics_path),
+        "metrics_by_segment": str(metrics_by_segment_path),
+        "report": report_paths,
+    }
+    LOGGER.info("Filter finished: %s", json.dumps(summary, ensure_ascii=False, sort_keys=True))
+    print(json.dumps(summary, indent=2))
 
 
 def apply_filter_to_record(
@@ -230,7 +259,7 @@ def collect_anchors_from_zip(args: argparse.Namespace, checkpoint: dict[str, Any
                 try:
                     obj = json.loads(raw_line)
                 except json.JSONDecodeError as exc:
-                    print(f"Skipping invalid JSON at line {lines_read}: {exc}", file=sys.stderr)
+                    LOGGER.warning("Skipping invalid JSON at line %s: %s", lines_read, exc)
                     continue
                 source = get_source(obj)
                 ts = event_time(source)
@@ -281,6 +310,19 @@ def collect_anchors_from_zip(args: argparse.Namespace, checkpoint: dict[str, Any
 
 
 def extract_filter(args: argparse.Namespace) -> None:
+    gateway = OllamaGateway(
+        args.ollama_url,
+        pull_missing=args.pull_missing,
+        timeout_seconds=args.timeout_seconds,
+        logger=LOGGER,
+    )
+    try:
+        _extract_filter(args, gateway)
+    finally:
+        cleanup_model_after_use(args, gateway, args.model)
+
+
+def _extract_filter(args: argparse.Namespace, gateway: OllamaGateway) -> None:
     zip_path = Path(args.zip)
     output_path = Path(args.output)
     anchors_path = Path(args.anchors)
@@ -296,6 +338,7 @@ def extract_filter(args: argparse.Namespace) -> None:
     anchor_checkpoint = load_checkpoint(anchor_checkpoint_path)
 
     if args.resume and checkpoint.get("phase") == "done":
+        LOGGER.info("Extract-filter checkpoint already done: %s", checkpoint_path)
         print(json.dumps(checkpoint, indent=2))
         return
 
@@ -351,7 +394,6 @@ def extract_filter(args: argparse.Namespace) -> None:
             },
         )
 
-    gateway = OllamaGateway(args.ollama_url, pull_missing=args.pull_missing, timeout_seconds=args.timeout_seconds)
     anchors = load_anchor_index(anchors_path, args.same_host)
     checkpoint = load_checkpoint(checkpoint_path)
     keep_fields = tuple(args.keep_field or DEFAULT_KEEP_FIELDS)
@@ -386,7 +428,7 @@ def extract_filter(args: argparse.Namespace) -> None:
                 try:
                     obj = json.loads(raw_line)
                 except json.JSONDecodeError as exc:
-                    print(f"Skipping invalid JSON at line {lines_read}: {exc}", file=sys.stderr)
+                    LOGGER.warning("Skipping invalid JSON at line %s: %s", lines_read, exc)
                     continue
                 source = get_source(obj)
                 ts = event_time(source)
@@ -470,20 +512,23 @@ def extract_filter(args: argparse.Namespace) -> None:
             "merge_anchor_gap_seconds": merge_anchor_gap_seconds,
         },
     )
-    print(
-        json.dumps(
-            {
-                **filter_metrics_summary(totals, len(by_segment)),
-                "processed": processed,
-                "written": written,
-                "output": str(output_path),
-                "anchors": str(anchors_path),
-                "metrics": str(metrics_path),
-                "metrics_by_segment": str(metrics_by_segment_path),
-            },
-            indent=2,
-        )
-    )
+    report_paths: dict[str, str] = {}
+    if args.keep_dropped:
+        report_paths = generate_filter_report(output_path, output_path.parent)
+    else:
+        LOGGER.warning("Skipping detailed filter report because --keep-dropped was not used.")
+    summary = {
+        **filter_metrics_summary(totals, len(by_segment)),
+        "processed": processed,
+        "written": written,
+        "output": str(output_path),
+        "anchors": str(anchors_path),
+        "metrics": str(metrics_path),
+        "metrics_by_segment": str(metrics_by_segment_path),
+        "report": report_paths,
+    }
+    LOGGER.info("Extract-filter finished: %s", json.dumps(summary, ensure_ascii=False, sort_keys=True))
+    print(json.dumps(summary, indent=2))
 
 
 def load_segments(path: Path, include_irrelevant: bool, max_events_per_segment: int) -> dict[str, dict[str, Any]]:
@@ -527,16 +572,28 @@ def classify_prompt(
 
 
 def classify_segments(args: argparse.Namespace) -> None:
+    gateway = OllamaGateway(
+        args.ollama_url,
+        pull_missing=args.pull_missing,
+        timeout_seconds=args.timeout_seconds,
+        logger=LOGGER,
+    )
+    try:
+        _classify_segments(args, gateway)
+    finally:
+        cleanup_model_after_use(args, gateway, args.model)
+
+
+def _classify_segments(args: argparse.Namespace, gateway: OllamaGateway) -> None:
     input_path = Path(args.input)
     output_path = Path(args.output)
     checkpoint_path = Path(args.checkpoint) if args.checkpoint else None
     checkpoint = load_checkpoint(checkpoint_path)
 
     if args.resume and checkpoint.get("phase") == "done":
+        LOGGER.info("Classify checkpoint already done: %s", checkpoint_path)
         print(json.dumps(checkpoint, indent=2))
         return
-
-    gateway = OllamaGateway(args.ollama_url, pull_missing=args.pull_missing, timeout_seconds=args.timeout_seconds)
 
     start_index = int(checkpoint.get("segment_index", 0)) if args.resume else 0
     written = int(checkpoint.get("written", 0)) if args.resume and output_path.exists() else 0
@@ -622,7 +679,36 @@ def classify_segments(args: argparse.Namespace) -> None:
             "prompt_format": args.prompt_format,
         },
     )
-    print(json.dumps({"segments": len(segments), "written": written, "output": str(output_path)}, indent=2))
+    report_paths = generate_classify_report(output_path, output_path.parent)
+    summary = {"segments": len(segments), "written": written, "output": str(output_path), "report": report_paths}
+    LOGGER.info("Classify finished: %s", json.dumps(summary, ensure_ascii=False, sort_keys=True))
+    print(json.dumps(summary, indent=2))
+
+
+def generate_filter_report(input_path: Path, output_dir: Path) -> dict[str, str]:
+    if not input_path.exists() or input_path.stat().st_size == 0:
+        LOGGER.warning("Skipping filter report because input is missing or empty: %s", input_path)
+        return {}
+    try:
+        paths = filter_report(input_path, output_dir)
+    except Exception as exc:
+        LOGGER.warning("Failed to generate filter report for %s: %s", input_path, exc)
+        return {}
+    LOGGER.info("Filter report written: %s", paths)
+    return paths
+
+
+def generate_classify_report(input_path: Path, output_dir: Path) -> dict[str, str]:
+    if not input_path.exists() or input_path.stat().st_size == 0:
+        LOGGER.warning("Skipping classification report because input is missing or empty: %s", input_path)
+        return {}
+    try:
+        paths = classify_report(input_path, output_dir)
+    except Exception as exc:
+        LOGGER.warning("Failed to generate classification report for %s: %s", input_path, exc)
+        return {}
+    LOGGER.info("Classification report written: %s", paths)
+    return paths
 
 
 def filter_metrics(args: argparse.Namespace) -> None:
@@ -650,6 +736,20 @@ def filter_metrics(args: argparse.Namespace) -> None:
             writer.writerows(rows)
 
     print(json.dumps(filter_metrics_summary(totals, len(rows), output_path), indent=2))
+
+
+def filter_report_cmd(args: argparse.Namespace) -> None:
+    input_path = Path(args.input)
+    output_dir = Path(args.output_dir) if args.output_dir else input_path.parent
+    paths = generate_filter_report(input_path, output_dir)
+    print(json.dumps(paths, indent=2))
+
+
+def classify_report_cmd(args: argparse.Namespace) -> None:
+    input_path = Path(args.input)
+    output_dir = Path(args.output_dir) if args.output_dir else input_path.parent
+    paths = generate_classify_report(input_path, output_dir)
+    print(json.dumps(paths, indent=2))
 
 
 def dataset_segment_files(input_dir: Path) -> list[Path]:
@@ -713,6 +813,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
         max_lines=args.max_filter_lines,
         prompt_format=args.prompt_format,
         pull_missing=args.pull_missing,
+        delete_model_after_use=args.delete_model_after_use,
+        log_file=getattr(args, "log_file", None),
         metrics=str(run_dir / "filter" / small_name / "metrics.json"),
         metrics_by_segment=str(run_dir / "filter" / small_name / "metrics_by_segment.csv"),
         progress=args.progress,
@@ -737,6 +839,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
             max_segments=args.max_segments,
             prompt_format=args.prompt_format,
             pull_missing=args.pull_missing,
+            delete_model_after_use=args.delete_model_after_use,
+            log_file=getattr(args, "log_file", None),
             progress=args.progress,
         )
         classify_segments(classify_args)
@@ -764,6 +868,8 @@ def run_dataset_pipeline(args: argparse.Namespace) -> None:
         progress=args.progress,
         ollama_url=args.ollama_url,
         pull_missing=args.pull_missing,
+        delete_model_after_use=args.delete_model_after_use,
+        log_file=getattr(args, "log_file", None),
         prompt_format=args.prompt_format,
     )
     run_pipeline(pipeline_args)
@@ -813,6 +919,8 @@ def run_direct_pipeline(args: argparse.Namespace) -> None:
         resume=args.resume,
         prompt_format=args.prompt_format,
         pull_missing=args.pull_missing,
+        delete_model_after_use=args.delete_model_after_use,
+        log_file=getattr(args, "log_file", None),
         metrics=str(run_dir / "filter" / small_name / "metrics.json"),
         metrics_by_segment=str(run_dir / "filter" / small_name / "metrics_by_segment.csv"),
         before_seconds=args.before_seconds,
@@ -852,6 +960,8 @@ def run_direct_pipeline(args: argparse.Namespace) -> None:
             max_segments=args.max_classify_segments,
             prompt_format=args.prompt_format,
             pull_missing=args.pull_missing,
+            delete_model_after_use=args.delete_model_after_use,
+            log_file=getattr(args, "log_file", None),
             progress=args.progress,
         )
         classify_segments(classify_args)
@@ -860,7 +970,48 @@ def run_direct_pipeline(args: argparse.Namespace) -> None:
 def add_common_ollama_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--ollama-url", default="http://localhost:11434")
     parser.add_argument("--pull-missing", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--delete-model-after-use", action="store_true")
+    parser.add_argument("--log-file")
     parser.add_argument("--prompt-format", choices=("csv", "json"), default="csv")
+
+
+def default_log_file(args: argparse.Namespace) -> Path | None:
+    command = getattr(args, "command", "")
+    if getattr(args, "log_file", None):
+        return Path(args.log_file)
+    if command in {"run", "run-dataset", "run-direct"}:
+        return Path(args.run_dir) / "pipeline.log"
+    output = getattr(args, "output", None)
+    if output:
+        return Path(output).parent / f"{command or 'pipeline'}.log"
+    output_dir = getattr(args, "output_dir", None)
+    if output_dir:
+        return Path(output_dir) / f"{command or 'pipeline'}.log"
+    input_path = getattr(args, "input", None)
+    if command in {"filter-report", "classify-report"} and input_path:
+        return Path(input_path).parent / f"{command}.log"
+    return None
+
+
+def setup_logging(args: argparse.Namespace) -> None:
+    LOGGER.handlers.clear()
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.propagate = False
+
+    console = logging.StreamHandler(sys.stderr)
+    console.setLevel(logging.WARNING)
+    console.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    LOGGER.addHandler(console)
+
+    log_path = default_log_file(args)
+    if log_path is None:
+        return
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    LOGGER.addHandler(file_handler)
+    LOGGER.info("Logging to %s", log_path)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -999,12 +1150,27 @@ def build_parser() -> argparse.ArgumentParser:
     metrics_cmd.add_argument("--technique-id")
     metrics_cmd.set_defaults(func=filter_metrics)
 
+    filter_report_parser = sub.add_parser("filter-report", help="Generate detailed filter metrics and error reports.")
+    filter_report_parser.add_argument("--input", required=True)
+    filter_report_parser.add_argument("--output-dir")
+    filter_report_parser.add_argument("--log-file")
+    filter_report_parser.set_defaults(func=filter_report_cmd)
+
+    classify_report_parser = sub.add_parser(
+        "classify-report", help="Generate detailed classification metrics and error reports."
+    )
+    classify_report_parser.add_argument("--input", required=True)
+    classify_report_parser.add_argument("--output-dir")
+    classify_report_parser.add_argument("--log-file")
+    classify_report_parser.set_defaults(func=classify_report_cmd)
+
     return parser
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    setup_logging(args)
     args.func(args)
 
 

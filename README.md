@@ -169,6 +169,54 @@ docker compose up -d ollama
 
 O pipeline usa a biblioteca Python `ollama`. Se um modelo não existir localmente, o
 script tenta baixá-lo automaticamente. Para impedir isso, use `--no-pull-missing`.
+Para economizar disco, use `--delete-model-after-use`: o script remove do Ollama cada
+modelo efetivamente usado ao final da etapa, inclusive se a etapa falhar.
+Os comandos `run`, `run-dataset` e `run-direct` gravam logs legíveis em
+`<run-dir>/pipeline.log` por padrão. Para escolher outro arquivo, use `--log-file`.
+
+## Métricas Estatísticas
+
+Ao final da filtragem, o pipeline gera relatórios na pasta do modelo pequeno:
+
+```text
+filter_metrics.json
+filter_confusion.csv
+filter_metrics_by_segment.csv
+filter_timing.csv
+filter_false_negatives.jsonl
+filter_false_positives.jsonl
+```
+
+Na filtragem, o ground truth positivo é a linha que tinha `rule_technique_id` oculto em
+`evaluation`. `filter_false_negatives.jsonl` contém os logs maliciosos removidos pelo
+filtro, incluindo linha, MITRE, `llm_event` completo, avaliação e resposta do modelo.
+
+Ao final da classificação, cada pasta de modelo grande recebe:
+
+```text
+classification_metrics.json
+classification_confusion.csv
+classification_timing.csv
+classification_chunk_timing.csv
+classification_false_negatives.jsonl
+classification_false_positives.jsonl
+classification_true_positives.jsonl
+classification_true_negatives.jsonl
+```
+
+As métricas incluem TP, FP, FN, TN, precisão, recall, especificidade, acurácia, F1,
+balanced accuracy, erros de parse/inferência e tempos por inferência. Para recalcular:
+
+```bash
+uv run python scripts/comiset_llm_pipeline.py filter-report \
+  --input runs/final/filter/llama3.2_3b/filtered_events.jsonl
+
+uv run python scripts/comiset_llm_pipeline.py classify-report \
+  --input runs/final/classify/llama3.2_3b/deepseek-r1_14b/classifications.jsonl
+```
+
+No `run-direct`, use `--keep-dropped` se quiser auditoria detalhada completa dos logs
+removidos; sem isso, o JSONL da filtragem guarda só os logs mantidos.
 
 ## 2. Gerar Âncoras
 

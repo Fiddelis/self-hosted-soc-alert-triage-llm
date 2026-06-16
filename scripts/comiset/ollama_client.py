@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 
 class OllamaGateway:
-    def __init__(self, host: str, pull_missing: bool = True, timeout_seconds: int | None = None) -> None:
+    def __init__(
+        self,
+        host: str,
+        pull_missing: bool = True,
+        timeout_seconds: int | None = None,
+        logger: logging.Logger | None = None,
+    ) -> None:
         try:
             import ollama
         except ImportError as exc:
@@ -15,6 +22,8 @@ class OllamaGateway:
         self._client = ollama.Client(host=host, timeout=timeout_seconds)
         self._pull_missing = pull_missing
         self._ready: set[str] = set()
+        self._pull_logged: set[str] = set()
+        self._logger = logger
 
     def ensure_model(self, model: str) -> None:
         if model in self._ready:
@@ -24,10 +33,23 @@ class OllamaGateway:
         except Exception:
             if not self._pull_missing:
                 raise
-            print(f"Model {model!r} not found locally. Pulling with Ollama...")
+            if model not in self._pull_logged:
+                message = f"Model {model!r} not found locally. Pulling with Ollama..."
+                if self._logger:
+                    self._logger.info(message)
+                else:
+                    print(message)
+                self._pull_logged.add(model)
             self._client.pull(model)
             self._client.show(model)
         self._ready.add(model)
+
+    def delete_ready_model(self, model: str) -> bool:
+        if model not in self._ready:
+            return False
+        self._client.delete(model)
+        self._ready.discard(model)
+        return True
 
     def chat(
         self,
