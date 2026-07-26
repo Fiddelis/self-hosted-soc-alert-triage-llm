@@ -1,7 +1,9 @@
 # COMISET Dataset Materializado + LLM Pipeline
 
+Documentação técnica completa: [`docs/aplicacao.md`](docs/aplicacao.md).
+
 Este projeto prepara um dataset pequeno e fixo a partir dos ZIPs do COMISET e roda os
-testes com Ollama sobre esses arquivos materializados. O fluxo recomendado é:
+testes locais com llama.cpp sobre esses arquivos materializados. O fluxo recomendado é:
 
 ```text
 dataset/lab.zip + dataset/lab_anchors.jsonl -> dataset/anchors.best.jsonl -> dataset/processed/lab/*.jsonl
@@ -24,8 +26,8 @@ dataset/
 
 Este comando usa as 49 técnicas de `lab_anchors.jsonl`, resolve no `lab.zip` um evento
 real de cada técnica e extrai cerca de 200 logs em volta da linha do ataque. Para o
-real, cria/reutiliza um prefixo descompactado de 2 GiB e amostra 200 janelas de 200
-logs sem repetir linhas entre arquivos.
+real, cria/reutiliza um prefixo descompactado de 2 GiB, coleta os primeiros 1.000
+blocos limpos e não sobrepostos e sorteia 200 janelas de 200 logs com seed fixa.
 
 ```bash
 uv run python scripts/comiset_extract.py prepare-dataset \
@@ -35,6 +37,7 @@ uv run python scripts/comiset_extract.py prepare-dataset \
   --best-anchors dataset/anchors.best.jsonl \
   --output-dir dataset/processed \
   --real-count 200 \
+  --real-candidate-pool 1000 \
   --events-per-segment 200 \
   --seed 2026
 ```
@@ -54,20 +57,34 @@ dataset/cache/real_prefix.jsonl
 `dataset/anchors.best.jsonl` guarda as âncoras lab resolvidas, incluindo a linha real
 usada como centro (`resolved_anchor_line`) e os limites de linha (`line_start`/`line_end`).
 `anchors.sampled.jsonl` guarda as âncoras sintéticas do real, também com
-`line_start`/`line_end`, para auditoria. Se quiser recriar exatamente a mesma amostra,
-mantenha a mesma seed e o mesmo prefixo.
+`line_start`/`line_end`, para auditoria. Cada janela segue a mesma geometria do lab:
+100 logs anteriores, evento central e 99 posteriores. Janelas com qualquer rótulo MITRE
+são rejeitadas. Para recriar a mesma amostra, mantenha pool, seed e prefixo.
 
-## 2. Rodar Testes Ollama Sobre O Dataset Pronto
+## 2. Rodar Testes Locais Sobre O Dataset Pronto
+
+Somente filtragem com o modelo pequeno:
+
+```bash
+uv run python scripts/comiset_llm_pipeline.py filter-dataset \
+  --input-dir dataset/processed \
+  --run-dir runs/small-filter \
+  --model bartowski/Llama-3.2-3B-Instruct-GGUF@main:Llama-3.2-3B-Instruct-Q4_K_M.gguf \
+  --n-gpu-layers -1 \
+  --prompt-format csv
+```
+
+Pipeline completo com classificadores:
 
 ```bash
 uv run python scripts/comiset_llm_pipeline.py run-dataset \
   --input-dir dataset/processed \
   --run-dir runs/final \
-  --small-model llama3.2:3b \
-  --big-model deepseek-r1:14b \
-  --big-model qwen3:14b \
-  --big-model phi4:14b \
-  --big-model mistral-nemo:12b \
+  --small-model bartowski/Llama-3.2-3B-Instruct-GGUF:Llama-3.2-3B-Instruct-Q4_K_M.gguf \
+  --big-model bartowski/DeepSeek-R1-Distill-Qwen-14B-GGUF:DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf \
+  --big-model Qwen/Qwen3-14B-GGUF:Qwen3-14B-Q4_K_M.gguf \
+  --big-model bartowski/phi-4-GGUF:phi-4-Q4_K_M.gguf \
+  --big-model bartowski/Mistral-Nemo-Instruct-2407-GGUF:Mistral-Nemo-Instruct-2407-Q4_K_M.gguf \
   --max-tokens 1500 \
   --prompt-format csv
 ```
@@ -149,9 +166,8 @@ Descrição dos arquivos:
   materializar tudo antes da LLM para auditoria/debug.
 - `segment_summary.csv`: resumo com quantidade de linhas/eventos por segmento/ataque.
 - `by_segment/`: pasta opcional com um `.jsonl` separado para cada segmento/ataque.
-- `filtered_events.jsonl`: saída do modelo pequeno. No fluxo direto, por padrão salva só
-  as linhas mantidas pelo filtro. Use `--keep-dropped` se quiser salvar também as
-  removidas.
+- `filtered_events.jsonl`: saída completa do modelo pequeno, incluindo linhas mantidas,
+  descartadas e erros, para preservar todos os segmentos no denominador.
 - `metrics.json`: métricas globais da filtragem, como total de linhas, quantas ficaram,
   quantas foram removidas e quantas linhas com rule foram removidas.
 - `metrics_by_segment.csv`: mesmas métricas de filtragem, mas separadas por
@@ -161,18 +177,31 @@ Descrição dos arquivos:
 - `checkpoint.json`: progresso da etapa. Permite continuar com `--resume` se o processo
   parar no meio.
 
-## 1. Subir Ollama
+## Executar Modelos GGUF Localmente
+
+O pipeline usa `llama-cpp-python` diretamente: não há servidor Ollama. Cada
+`--model`, `--small-model` e `--big-model` recebe
+`repositorio-hf[@revisão]:arquivo.gguf`. Para o benchmark final, use o commit do
+Hugging Face; a revisão resolvida e o SHA-256 também ficam em `run_manifest.json`.
+O arquivo é baixado e mantido no cache padrão do Hugging Face; defina `HF_HOME`
+caso queira outro local. Os comandos abaixo usam exemplos GGUF Q4_K_M do
+Hugging Face.
+
+Instale a extensão nativa para o hardware antes de executar:
 
 ```bash
-docker compose up -d ollama
+# Apple Silicon (Metal)
+CMAKE_ARGS="-DGGML_METAL=on" uv sync --reinstall-package llama-cpp-python
+
+# Linux + NVIDIA (CUDA)
+CMAKE_ARGS="-DGGML_CUDA=on" uv sync --reinstall-package llama-cpp-python
 ```
 
-O pipeline usa a biblioteca Python `ollama`. Se um modelo não existir localmente, o
-script tenta baixá-lo automaticamente. Para impedir isso, use `--no-pull-missing`.
-Para economizar disco, use `--delete-model-after-use`: o script remove do Ollama cada
-modelo efetivamente usado ao final da etapa, inclusive se a etapa falhar.
-Os comandos `run`, `run-dataset` e `run-direct` gravam logs legíveis em
-`<run-dir>/pipeline.log` por padrão. Para escolher outro arquivo, use `--log-file`.
+Por padrão o pipeline tenta descarregar todas as camadas na GPU
+(`--n-gpu-layers -1`). Ajuste `--n-ctx`, `--n-batch` e `--n-gpu-layers` conforme
+VRAM; use `--n-gpu-layers 0` para CPU. `--seed 2026`, `--warmup-runs 1`,
+`--inference-runs 1` e `--max-output-tokens 512` são os padrões reproduzíveis.
+Download, hash, carga, warm-up, hardware e parâmetros são registrados separadamente.
 
 ## Métricas Estatísticas
 
@@ -185,6 +214,7 @@ filter_metrics_by_segment.csv
 filter_timing.csv
 filter_false_negatives.jsonl
 filter_false_positives.jsonl
+filter_errors.jsonl
 ```
 
 Na filtragem, o ground truth positivo é a linha que tinha `rule_technique_id` oculto em
@@ -202,6 +232,7 @@ classification_false_negatives.jsonl
 classification_false_positives.jsonl
 classification_true_positives.jsonl
 classification_true_negatives.jsonl
+classification_errors.jsonl
 ```
 
 As métricas incluem TP, FP, FN, TN, precisão, recall, especificidade, acurácia, F1,
@@ -215,8 +246,8 @@ uv run python scripts/comiset_llm_pipeline.py classify-report \
   --input runs/final/classify/llama3.2_3b/deepseek-r1_14b/classifications.jsonl
 ```
 
-No `run-direct`, use `--keep-dropped` se quiser auditoria detalhada completa dos logs
-removidos; sem isso, o JSONL da filtragem guarda só os logs mantidos.
+Todos os modos preservam descartes e erros. `--keep-dropped` permanece aceito apenas
+por compatibilidade com comandos antigos.
 
 ## 2. Gerar Âncoras
 
@@ -302,11 +333,11 @@ Lab:
 uv run python scripts/comiset_llm_pipeline.py run-direct \
   --zip dataset/lab.zip \
   --run-dir runs/lab \
-  --small-model llama3.2:3b \
-  --big-model deepseek-r1:14b \
-  --big-model qwen3:14b \
-  --big-model phi4:14b \
-  --big-model mistral-nemo:12b \
+  --small-model bartowski/Llama-3.2-3B-Instruct-GGUF:Llama-3.2-3B-Instruct-Q4_K_M.gguf \
+  --big-model bartowski/DeepSeek-R1-Distill-Qwen-14B-GGUF:DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf \
+  --big-model Qwen/Qwen3-14B-GGUF:Qwen3-14B-Q4_K_M.gguf \
+  --big-model bartowski/phi-4-GGUF:phi-4-Q4_K_M.gguf \
+  --big-model bartowski/Mistral-Nemo-Instruct-2407-GGUF:Mistral-Nemo-Instruct-2407-Q4_K_M.gguf \
   --max-tokens 1500 \
   --prompt-format csv
 ```
@@ -317,11 +348,11 @@ Real:
 uv run python scripts/comiset_llm_pipeline.py run-direct \
   --zip dataset/real.zip \
   --run-dir runs/real \
-  --small-model llama3.2:3b \
-  --big-model deepseek-r1:14b \
-  --big-model qwen3:14b \
-  --big-model phi4:14b \
-  --big-model mistral-nemo:12b \
+  --small-model bartowski/Llama-3.2-3B-Instruct-GGUF:Llama-3.2-3B-Instruct-Q4_K_M.gguf \
+  --big-model bartowski/DeepSeek-R1-Distill-Qwen-14B-GGUF:DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf \
+  --big-model Qwen/Qwen3-14B-GGUF:Qwen3-14B-Q4_K_M.gguf \
+  --big-model bartowski/phi-4-GGUF:phi-4-Q4_K_M.gguf \
+  --big-model bartowski/Mistral-Nemo-Instruct-2407-GGUF:Mistral-Nemo-Instruct-2407-Q4_K_M.gguf \
   --max-tokens 1500 \
   --prompt-format csv
 ```
@@ -353,7 +384,8 @@ runs/lab/classify/llama3.2_3b/qwen3_14b/classifications.jsonl
 ```
 
 O prompt usa CSV por padrão para economizar tokens. A classificação divide segmentos
-grandes em chunks de aproximadamente `--max-tokens`.
+grandes em chunks de aproximadamente `--max-tokens` e consolida chunks válidos por
+maioria; erros se abstêm e empate resulta em `Not Interesting`.
 
 ## 4. Extração Materializada Opcional
 
@@ -436,11 +468,11 @@ segment_events.jsonl -> modelo pequeno -> modelos grandes
 uv run python scripts/comiset_llm_pipeline.py run \
   --input runs/lab/extract/segment_events.jsonl \
   --run-dir runs/lab \
-  --small-model llama3.2:3b \
-  --big-model deepseek-r1:14b \
-  --big-model qwen3:14b \
-  --big-model phi4:14b \
-  --big-model mistral-nemo:12b \
+  --small-model bartowski/Llama-3.2-3B-Instruct-GGUF:Llama-3.2-3B-Instruct-Q4_K_M.gguf \
+  --big-model bartowski/DeepSeek-R1-Distill-Qwen-14B-GGUF:DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf \
+  --big-model Qwen/Qwen3-14B-GGUF:Qwen3-14B-Q4_K_M.gguf \
+  --big-model bartowski/phi-4-GGUF:phi-4-Q4_K_M.gguf \
+  --big-model bartowski/Mistral-Nemo-Instruct-2407-GGUF:Mistral-Nemo-Instruct-2407-Q4_K_M.gguf \
   --max-tokens 1500 \
   --prompt-format csv
 ```
@@ -488,11 +520,9 @@ uv run python scripts/comiset_llm_pipeline.py filter-metrics \
   --output runs/lab/filter/llama3.2_3b/filter_metrics.csv
 ```
 
-Observação: no modo `run-direct`, `filtered_events.jsonl` salva só linhas mantidas por
-padrão. Portanto, para esse modo, use o `metrics.json` e `metrics_by_segment.csv`
-gerados durante a execução como fonte correta dos descartes. Recalcular por
-`filter-metrics` só preserva contagem de removidos se você tiver rodado com
-`--keep-dropped`.
+No modo `run-direct`, `filtered_events.jsonl` também preserva todas as linhas. Assim,
+segmentos totalmente descartados continuam disponíveis e são contabilizados como FN/TN
+na classificação, em vez de desaparecerem do denominador.
 
 Para uma técnica específica:
 
@@ -515,7 +545,7 @@ uv run python scripts/comiset_llm_pipeline.py extract-filter \
   --anchors runs/lab/anchors/anchors.jsonl \
   --checkpoint runs/lab/filter/llama3.2_3b/checkpoint.json \
   --anchor-checkpoint runs/lab/anchors/checkpoint.json \
-  --model llama3.2:3b \
+  --model bartowski/Llama-3.2-3B-Instruct-GGUF:Llama-3.2-3B-Instruct-Q4_K_M.gguf \
   --prompt-format csv
 ```
 
@@ -526,7 +556,7 @@ uv run python scripts/comiset_llm_pipeline.py filter \
   --input runs/lab/extract/segment_events.jsonl \
   --output runs/lab/filter/llama3.2_3b/filtered_events.jsonl \
   --checkpoint runs/lab/filter/llama3.2_3b/checkpoint.json \
-  --model llama3.2:3b \
+  --model bartowski/Llama-3.2-3B-Instruct-GGUF:Llama-3.2-3B-Instruct-Q4_K_M.gguf \
   --prompt-format csv
 ```
 
@@ -537,7 +567,7 @@ uv run python scripts/comiset_llm_pipeline.py classify \
   --input runs/lab/filter/llama3.2_3b/filtered_events.jsonl \
   --output runs/lab/classify/llama3.2_3b/deepseek-r1_14b/classifications.jsonl \
   --checkpoint runs/lab/classify/llama3.2_3b/deepseek-r1_14b/checkpoint.json \
-  --model deepseek-r1:14b \
+  --model bartowski/DeepSeek-R1-Distill-Qwen-14B-GGUF:DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf \
   --max-tokens 1500 \
   --prompt-format csv
 ```

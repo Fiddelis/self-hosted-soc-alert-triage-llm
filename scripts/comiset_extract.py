@@ -13,11 +13,13 @@ import shutil
 import sys
 import zipfile
 from bisect import bisect_right
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from comiset.privacy import reveals_mitre_label, split_event_labels
 from comiset.progress import ProgressBar
 
 
@@ -144,15 +146,7 @@ def split_llm_and_evaluation_event(
     event: dict[str, Any],
     label_fields: tuple[str, ...],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    label_names = {field.lower() for field in label_fields}
-    llm_event: dict[str, Any] = {}
-    hidden_labels: dict[str, Any] = {}
-    for key, value in event.items():
-        if key.lower() in label_names:
-            hidden_labels[key] = value
-        else:
-            llm_event[key] = value
-
+    llm_event, hidden_labels = split_event_labels(event, label_fields)
     return llm_event, {
         "event_has_rule_technique": bool(hidden_labels),
         "hidden_label_fields": hidden_labels,
@@ -1886,78 +1880,101 @@ def ensure_real_prefix_cache(
     return str(cache_path), bytes_written
 
 
-def real_prefix_candidates(prefix_path: Path, progress_enabled: bool) -> tuple[list[dict[str, Any]], int]:
+def source_has_mitre_label(source: dict[str, Any]) -> bool:
+    if first_value(source, DEFAULT_LABEL_FIELDS) not in (None, "", [], {}):
+        return True
+    rule_name = first_value(source, ("RuleName", "rule.name"))
+    return reveals_mitre_label(rule_name)
+
+
+def real_prefix_candidates(
+    prefix_path: Path,
+    pool_size: int,
+    events_per_segment: int,
+    progress_enabled: bool,
+) -> tuple[list[dict[str, Any]], int]:
+    if pool_size < 1:
+        raise SystemExit("--real-candidate-pool must be >= 1")
+    if events_per_segment < 1:
+        raise SystemExit("--events-per-segment must be >= 1")
+
     candidates: list[dict[str, Any]] = []
+    window: deque[tuple[int, dict[str, Any] | None]] = deque(maxlen=events_per_segment)
+    last_window_end = 0
     total_lines = 0
     total_bytes = prefix_path.stat().st_size
     bytes_read = 0
-    progress = ProgressBar("real prefix scan", total_bytes, enabled=progress_enabled)
+    progress = ProgressBar("real clean-window scan", total_bytes, enabled=progress_enabled)
     with prefix_path.open(encoding="utf-8") as handle:
         for raw_line in handle:
             total_lines += 1
             bytes_read += len(raw_line.encode("utf-8"))
-            progress.update(bytes_read, suffix=f"lines={total_lines} candidates={len(candidates)}")
+            progress.update(bytes_read, suffix=f"lines={total_lines} clean_windows={len(candidates)}/{pool_size}")
             try:
-                obj = json.loads(raw_line)
+                source = get_source(json.loads(raw_line))
             except json.JSONDecodeError as exc:
                 print(f"Skipping invalid JSON at prefix line {total_lines}: {exc}", file=sys.stderr)
+                source = None
+            window.append((total_lines, source))
+            if len(window) < events_per_segment:
                 continue
-            source = get_source(obj)
-            ts = event_time(source)
-            host = event_host(source)
+
+            line_start = window[0][0]
+            if line_start <= last_window_end:
+                continue
+            if any(source is None or source_has_mitre_label(source) for _, source in window):
+                continue
+
+            anchor_line, anchor_source = window[events_per_segment // 2]
+            assert anchor_source is not None
+            ts = event_time(anchor_source)
+            host = event_host(anchor_source)
             if ts is None or host is None:
                 continue
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
             candidates.append(
                 {
-                    "line": total_lines,
+                    "line": anchor_line,
+                    "line_start": line_start,
+                    "line_end": window[-1][0],
                     "anchor_time": ts,
                     "host": host,
                 }
             )
-    progress.close(suffix=f"lines={total_lines} candidates={len(candidates)}")
+            last_window_end = window[-1][0]
+            if len(candidates) >= pool_size:
+                break
+    progress.close(suffix=f"lines={total_lines} clean_windows={len(candidates)}")
     return candidates, total_lines
-
-
-def intervals_overlap(left: tuple[int, int], right: tuple[int, int]) -> bool:
-    return left[0] <= right[1] and right[0] <= left[1]
 
 
 def sample_real_anchors_from_prefix(
     prefix_path: Path,
     count: int,
+    candidate_pool_size: int,
     seed: int,
     before_seconds: int,
     after_seconds: int,
     events_per_segment: int,
     progress_enabled: bool,
 ) -> tuple[list[dict[str, Any]], int, int]:
-    candidates, total_lines = real_prefix_candidates(prefix_path, progress_enabled)
-    rng = random.Random(seed)
-    shuffled = list(candidates)
-    rng.shuffle(shuffled)
-
-    selected: list[dict[str, Any]] = []
-    used_intervals: list[tuple[int, int]] = []
-    for candidate in shuffled:
-        line_start, line_end = line_window_for_anchor(candidate["line"], events_per_segment, total_lines)
-        if (line_end - line_start + 1) < events_per_segment:
-            continue
-        interval = (line_start, line_end)
-        if any(intervals_overlap(interval, used) for used in used_intervals):
-            continue
-        selected.append({**candidate, "line_start": line_start, "line_end": line_end})
-        used_intervals.append(interval)
-        if len(selected) >= count:
-            break
-
-    if len(selected) < count:
+    if candidate_pool_size < count:
+        raise SystemExit("--real-candidate-pool must be >= --real-count")
+    candidates, lines_read = real_prefix_candidates(
+        prefix_path,
+        candidate_pool_size,
+        events_per_segment,
+        progress_enabled,
+    )
+    if len(candidates) < candidate_pool_size:
         raise SystemExit(
-            f"Only {len(selected)} non-overlapping real windows found in {prefix_path}; requested {count}. "
-            "Increase --real-prefix-bytes or reduce --real-count/--events-per-segment."
+            f"Only {len(candidates)} clean non-overlapping real windows found in {prefix_path}; "
+            f"requested a pool of {candidate_pool_size}. Increase --real-prefix-bytes or reduce "
+            "--real-candidate-pool/--events-per-segment."
         )
 
+    selected = random.Random(seed).sample(candidates, count)
     before = timedelta(seconds=before_seconds)
     after = timedelta(seconds=after_seconds)
     anchors = []
@@ -1978,12 +1995,24 @@ def sample_real_anchors_from_prefix(
             "line_start": item["line_start"],
             "line_end": item["line_end"],
             "events_per_segment": events_per_segment,
+            "candidate_pool_size": candidate_pool_size,
             "sample_index": index,
             "sample_seed": seed,
             "real_prefix_cache": str(prefix_path),
         }
         anchors.append(anchor)
-    return anchors, total_lines, len(candidates)
+    return anchors, lines_read, len(candidates)
+
+
+def validate_clean_real_segments(segment_infos: dict[str, dict[str, Any]], events_per_segment: int) -> None:
+    for info in segment_infos.values():
+        records = load_jsonl(info["path"])
+        if len(records) != events_per_segment:
+            raise SystemExit(f"Real segment {info['path']} has {len(records)} events; expected {events_per_segment}")
+        for record in records:
+            evaluation = record.get("evaluation", {})
+            if evaluation.get("hidden_label_fields") or source_has_mitre_label(record.get("llm_event", {})):
+                raise SystemExit(f"MITRE label found in real segment {info['path']} at event line {record.get('event_line')}")
 
 
 def prepare_dataset_command(args: argparse.Namespace) -> None:
@@ -2043,9 +2072,10 @@ def prepare_dataset_command(args: argparse.Namespace) -> None:
         args.real_prefix_bytes,
         args.progress,
     )
-    real_anchors, real_prefix_lines, real_valid_events = sample_real_anchors_from_prefix(
+    real_anchors, real_prefix_lines, real_clean_candidates = sample_real_anchors_from_prefix(
         Path(real_prefix_path),
         args.real_count,
+        args.real_candidate_pool,
         args.seed,
         args.before_seconds,
         args.after_seconds,
@@ -2064,9 +2094,7 @@ def prepare_dataset_command(args: argparse.Namespace) -> None:
         args.max_real_extract_lines,
     )
     if not args.max_real_extract_lines:
-        empty_real = [str(info["path"]) for info in real_infos.values() if info["event_count"] == 0]
-        if empty_real:
-            raise SystemExit(f"Real extraction produced empty segment files: {', '.join(empty_real[:5])}")
+        validate_clean_real_segments(real_infos, args.events_per_segment)
     write_manifest(real_dir / "manifest.csv", real_infos)
 
     print(
@@ -2082,7 +2110,8 @@ def prepare_dataset_command(args: argparse.Namespace) -> None:
                 "real_prefix_cache": real_prefix_path,
                 "real_prefix_bytes": real_prefix_bytes,
                 "real_prefix_lines": real_prefix_lines,
-                "real_valid_events_seen": real_valid_events,
+                "real_clean_candidate_windows": real_clean_candidates,
+                "real_candidate_pool": args.real_candidate_pool,
                 "real_extract_lines_read": real_extract_lines,
                 "events_per_segment": args.events_per_segment,
                 "output_dir": str(output_dir),
@@ -2155,6 +2184,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     prepare_cmd.add_argument("--expected-lab-segments", type=int, default=49)
     prepare_cmd.add_argument("--real-count", type=int, default=200)
+    prepare_cmd.add_argument(
+        "--real-candidate-pool",
+        type=int,
+        default=1000,
+        help="Select --real-count windows from the first N clean non-overlapping real windows.",
+    )
     prepare_cmd.add_argument("--events-per-segment", type=int, default=200)
     prepare_cmd.add_argument("--real-prefix-cache", default="dataset/cache/real_prefix.jsonl")
     prepare_cmd.add_argument("--real-prefix-bytes", type=int, default=DEFAULT_REAL_PREFIX_BYTES)

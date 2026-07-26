@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import logging
 import shutil
@@ -44,10 +45,11 @@ from comiset.metrics import (
     write_filter_metrics,
 )
 from comiset.naming import safe_name
-from comiset.ollama_client import OllamaGateway
+from comiset.llama_cpp_client import LlamaCppGateway, parse_model_ref, sha256_file
 from comiset.progress import ProgressBar
 from comiset.prompts import CLASSIFY_SYSTEM_PROMPT, FILTER_SYSTEM_PROMPT
 from comiset.records import (
+    aggregate_chunk_results,
     approx_chunks,
     chunk_to_prompt_payload,
     is_relevant,
@@ -70,32 +72,90 @@ def filter_prompt(record: dict[str, Any], prompt_format: str) -> str:
     )
 
 
-def filter_records(args: argparse.Namespace) -> None:
-    gateway = OllamaGateway(
-        args.ollama_url,
-        pull_missing=args.pull_missing,
-        timeout_seconds=args.timeout_seconds,
+def gateway_from_args(args: argparse.Namespace) -> LlamaCppGateway:
+    return LlamaCppGateway(
+        args.n_ctx,
+        args.n_gpu_layers,
+        args.n_batch,
+        seed=args.seed,
+        max_output_tokens=args.max_output_tokens,
         logger=LOGGER,
     )
-    try:
-        _filter_records(args, gateway)
-    finally:
-        cleanup_model_after_use(args, gateway, args.model)
 
 
-def cleanup_model_after_use(args: argparse.Namespace, gateway: OllamaGateway, model: str) -> None:
-    if not getattr(args, "delete_model_after_use", False):
+def run_manifest_path(args: argparse.Namespace) -> Path:
+    if getattr(args, "run_manifest", None):
+        return Path(args.run_manifest)
+    if getattr(args, "run_dir", None):
+        return Path(args.run_dir) / "run_manifest.json"
+    return Path(args.output).parent / "run_manifest.json"
+
+
+def prepare_model(args: argparse.Namespace, gateway: LlamaCppGateway, model: str, phase: str) -> None:
+    model_data = gateway.prepare(model, args.warmup_runs)
+    path = run_manifest_path(args)
+    manifest = load_checkpoint(path)
+    manifest.setdefault("models", {})[model] = model_data
+    input_value = getattr(args, "input", None)
+    if input_value:
+        input_path = Path(input_value)
+        if input_path.is_file() and input_path.suffix.lower() != ".zip":
+            inputs = manifest.setdefault("inputs", {})
+            if str(input_path) not in inputs:
+                inputs[str(input_path)] = {
+                    "sha256": sha256_file(input_path),
+                    "size_bytes": input_path.stat().st_size,
+                }
+    manifest.setdefault("phases", {})[f"{phase}:{model}"] = {
+        "model": model,
+        "input": getattr(args, "input", None) or getattr(args, "zip", None),
+        "output": getattr(args, "output", None),
+        "prompt_format": args.prompt_format,
+        "max_input_tokens": getattr(args, "max_tokens", None),
+        "inference_runs": args.inference_runs,
+        "warmup_runs": args.warmup_runs,
+        "chunk_aggregation": "majority; ties are Not Interesting; invalid chunks abstain",
+        "filter_prompt_sha256": hashlib.sha256(FILTER_SYSTEM_PROMPT.encode()).hexdigest(),
+        "classify_prompt_sha256": hashlib.sha256(CLASSIFY_SYSTEM_PROMPT.encode()).hexdigest(),
+    }
+    save_checkpoint(path, manifest)
+
+
+def finalize_phase_manifest(args: argparse.Namespace, model: str, phase: str) -> None:
+    output = Path(args.output)
+    if not output.is_file():
         return
-    try:
-        deleted = gateway.delete_ready_model(model)
-    except Exception as exc:
-        LOGGER.warning("Failed to delete Ollama model %r: %s", model, exc)
-        return
-    if deleted:
-        LOGGER.info("Deleted Ollama model %r after use.", model)
+    path = run_manifest_path(args)
+    manifest = load_checkpoint(path)
+    phase_data = manifest.setdefault("phases", {}).setdefault(f"{phase}:{model}", {})
+    phase_data["output_sha256"] = sha256_file(output)
+    phase_data["output_size_bytes"] = output.stat().st_size
+    save_checkpoint(path, manifest)
 
 
-def _filter_records(args: argparse.Namespace, gateway: OllamaGateway) -> None:
+def chat_repeated(
+    args: argparse.Namespace,
+    gateway: LlamaCppGateway,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+) -> tuple[str, list[float]]:
+    if args.inference_runs < 1:
+        raise ValueError("--inference-runs must be >= 1")
+    responses = []
+    timings = []
+    for _ in range(args.inference_runs):
+        started = time.perf_counter()
+        responses.append(gateway.chat(model, system_prompt, user_prompt, args.timeout_seconds))
+        timings.append(time.perf_counter() - started)
+    return responses[0], timings
+
+
+def filter_records(args: argparse.Namespace) -> None:
+    _filter_records(args, gateway_from_args(args))
+
+
+def _filter_records(args: argparse.Namespace, gateway: LlamaCppGateway) -> None:
     input_path = Path(args.input)
     output_path = Path(args.output)
     checkpoint_path = Path(args.checkpoint) if args.checkpoint else None
@@ -110,6 +170,7 @@ def _filter_records(args: argparse.Namespace, gateway: OllamaGateway) -> None:
         print(json.dumps(checkpoint, indent=2))
         return
 
+    prepare_model(args, gateway, args.model, "filter")
     resume_line = int(checkpoint.get("input_line", 0)) if args.resume else 0
     processed = int(checkpoint.get("processed", 0)) if args.resume and output_path.exists() else 0
     if args.resume and output_path.exists():
@@ -130,23 +191,25 @@ def _filter_records(args: argparse.Namespace, gateway: OllamaGateway) -> None:
             if input_line <= resume_line:
                 continue
             record = json.loads(raw_line)
-            started = time.perf_counter()
             try:
-                response_text = gateway.chat(
+                response_text, timings = chat_repeated(
+                    args,
+                    gateway,
                     args.model,
                     FILTER_SYSTEM_PROMPT,
                     filter_prompt(record, args.prompt_format),
-                    args.timeout_seconds,
                 )
                 response = parse_json_response(response_text)
             except Exception as exc:
+                timings = []
                 response = {"error": str(exc), "relevant": False, "confidence": 0}
-            elapsed = time.perf_counter() - started
 
             record["filter_result"] = {
                 "model": args.model,
                 "prompt_format": args.prompt_format,
-                "elapsed_seconds": elapsed,
+                "elapsed_seconds": (sum(timings) / len(timings)) if timings else None,
+                "run_elapsed_seconds": timings,
+                "inference_runs": args.inference_runs,
                 **response,
             }
             out.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -188,6 +251,7 @@ def _filter_records(args: argparse.Namespace, gateway: OllamaGateway) -> None:
             "metric_totals": totals,
         },
     )
+    finalize_phase_manifest(args, args.model, "filter")
     report_paths = generate_filter_report(output_path, output_path.parent)
     summary = {
         **filter_metrics_summary(totals, len(by_segment)),
@@ -206,24 +270,24 @@ def apply_filter_to_record(
     model: str,
     prompt_format: str,
     timeout_seconds: int,
-    gateway: OllamaGateway,
+    inference_runs: int,
+    gateway: LlamaCppGateway,
 ) -> dict[str, Any]:
-    started = time.perf_counter()
+    timings = []
     try:
-        response_text = gateway.chat(
-            model,
-            FILTER_SYSTEM_PROMPT,
-            filter_prompt(record, prompt_format),
-            timeout_seconds,
-        )
+        for _ in range(inference_runs):
+            started = time.perf_counter()
+            response_text = gateway.chat(model, FILTER_SYSTEM_PROMPT, filter_prompt(record, prompt_format), timeout_seconds)
+            timings.append(time.perf_counter() - started)
         response = parse_json_response(response_text)
     except Exception as exc:
         response = {"error": str(exc), "relevant": False, "confidence": 0}
-    elapsed = time.perf_counter() - started
     record["filter_result"] = {
         "model": model,
         "prompt_format": prompt_format,
-        "elapsed_seconds": elapsed,
+        "elapsed_seconds": (sum(timings) / len(timings)) if timings else None,
+        "run_elapsed_seconds": timings,
+        "inference_runs": inference_runs,
         **response,
     }
     return record
@@ -310,19 +374,10 @@ def collect_anchors_from_zip(args: argparse.Namespace, checkpoint: dict[str, Any
 
 
 def extract_filter(args: argparse.Namespace) -> None:
-    gateway = OllamaGateway(
-        args.ollama_url,
-        pull_missing=args.pull_missing,
-        timeout_seconds=args.timeout_seconds,
-        logger=LOGGER,
-    )
-    try:
-        _extract_filter(args, gateway)
-    finally:
-        cleanup_model_after_use(args, gateway, args.model)
+    _extract_filter(args, gateway_from_args(args))
 
 
-def _extract_filter(args: argparse.Namespace, gateway: OllamaGateway) -> None:
+def _extract_filter(args: argparse.Namespace, gateway: LlamaCppGateway) -> None:
     zip_path = Path(args.zip)
     output_path = Path(args.output)
     anchors_path = Path(args.anchors)
@@ -342,6 +397,7 @@ def _extract_filter(args: argparse.Namespace, gateway: OllamaGateway) -> None:
         print(json.dumps(checkpoint, indent=2))
         return
 
+    prepare_model(args, gateway, args.model, "extract_filter")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     anchors_path.parent.mkdir(parents=True, exist_ok=True)
     raw_anchors_path.parent.mkdir(parents=True, exist_ok=True)
@@ -445,13 +501,13 @@ def _extract_filter(args: argparse.Namespace, gateway: OllamaGateway) -> None:
                         args.model,
                         args.prompt_format,
                         args.timeout_seconds,
+                        args.inference_runs,
                         gateway,
                     )
                     processed += 1
                     update_filter_metrics(totals, by_segment, record)
-                    if is_relevant(record) or args.keep_dropped:
-                        out.write(json.dumps(record, ensure_ascii=False) + "\n")
-                        written += 1
+                    out.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    written += 1
 
                     if processed % args.metrics_every == 0:
                         write_filter_metrics(metrics_path, metrics_by_segment_path, totals, by_segment)
@@ -512,11 +568,8 @@ def _extract_filter(args: argparse.Namespace, gateway: OllamaGateway) -> None:
             "merge_anchor_gap_seconds": merge_anchor_gap_seconds,
         },
     )
-    report_paths: dict[str, str] = {}
-    if args.keep_dropped:
-        report_paths = generate_filter_report(output_path, output_path.parent)
-    else:
-        LOGGER.warning("Skipping detailed filter report because --keep-dropped was not used.")
+    finalize_phase_manifest(args, args.model, "extract_filter")
+    report_paths = generate_filter_report(output_path, output_path.parent)
     summary = {
         **filter_metrics_summary(totals, len(by_segment)),
         "processed": processed,
@@ -536,8 +589,6 @@ def load_segments(path: Path, include_irrelevant: bool, max_events_per_segment: 
     with path.open(encoding="utf-8") as src:
         for raw_line in src:
             record = json.loads(raw_line)
-            if not include_irrelevant and not is_relevant(record):
-                continue
             segment = segments.setdefault(
                 record["segment_id"],
                 {
@@ -548,7 +599,7 @@ def load_segments(path: Path, include_irrelevant: bool, max_events_per_segment: 
                     "records": [],
                 },
             )
-            if len(segment["records"]) < max_events_per_segment:
+            if (include_irrelevant or is_relevant(record)) and len(segment["records"]) < max_events_per_segment:
                 segment["records"].append(record)
     return segments
 
@@ -572,19 +623,10 @@ def classify_prompt(
 
 
 def classify_segments(args: argparse.Namespace) -> None:
-    gateway = OllamaGateway(
-        args.ollama_url,
-        pull_missing=args.pull_missing,
-        timeout_seconds=args.timeout_seconds,
-        logger=LOGGER,
-    )
-    try:
-        _classify_segments(args, gateway)
-    finally:
-        cleanup_model_after_use(args, gateway, args.model)
+    _classify_segments(args, gateway_from_args(args))
 
 
-def _classify_segments(args: argparse.Namespace, gateway: OllamaGateway) -> None:
+def _classify_segments(args: argparse.Namespace, gateway: LlamaCppGateway) -> None:
     input_path = Path(args.input)
     output_path = Path(args.output)
     checkpoint_path = Path(args.checkpoint) if args.checkpoint else None
@@ -595,6 +637,7 @@ def _classify_segments(args: argparse.Namespace, gateway: OllamaGateway) -> None
         print(json.dumps(checkpoint, indent=2))
         return
 
+    prepare_model(args, gateway, args.model, "classify")
     start_index = int(checkpoint.get("segment_index", 0)) if args.resume else 0
     written = int(checkpoint.get("written", 0)) if args.resume and output_path.exists() else 0
     segments = list(load_segments(input_path, args.include_irrelevant, args.max_events_per_segment).values())
@@ -613,22 +656,25 @@ def _classify_segments(args: argparse.Namespace, gateway: OllamaGateway) -> None
             chunks = approx_chunks(segment["records"], args.max_tokens, args.prompt_format)
             chunk_results = []
             for chunk_index, records in enumerate(chunks, 1):
-                started = time.perf_counter()
                 try:
-                    response_text = gateway.chat(
+                    response_text, timings = chat_repeated(
+                        args,
+                        gateway,
                         args.model,
                         CLASSIFY_SYSTEM_PROMPT,
                         classify_prompt(segment, chunk_index, len(chunks), records, args.prompt_format),
-                        args.timeout_seconds,
                     )
                     response = parse_json_response(response_text)
                 except Exception as exc:
-                    response = {"error": str(exc), "classification": "Not Interesting", "confidence": 0}
+                    timings = []
+                    response = {"error": str(exc), "confidence": 0}
                 chunk_results.append(
                     {
                         "chunk_index": chunk_index,
                         "event_count": len(records),
-                        "elapsed_seconds": time.perf_counter() - started,
+                        "elapsed_seconds": (sum(timings) / len(timings)) if timings else None,
+                        "run_elapsed_seconds": timings,
+                        "inference_runs": args.inference_runs,
                         **response,
                     }
                 )
@@ -644,6 +690,7 @@ def _classify_segments(args: argparse.Namespace, gateway: OllamaGateway) -> None
                             "model": args.model,
                             "prompt_format": args.prompt_format,
                             "chunks": chunk_results,
+                            "aggregate": aggregate_chunk_results(chunk_results, empty_segment=not segment["records"]),
                         },
                     },
                     ensure_ascii=False,
@@ -679,6 +726,7 @@ def _classify_segments(args: argparse.Namespace, gateway: OllamaGateway) -> None
             "prompt_format": args.prompt_format,
         },
     )
+    finalize_phase_manifest(args, args.model, "classify")
     report_paths = generate_classify_report(output_path, output_path.parent)
     summary = {"segments": len(segments), "written": written, "output": str(output_path), "report": report_paths}
     LOGGER.info("Classify finished: %s", json.dumps(summary, ensure_ascii=False, sort_keys=True))
@@ -730,6 +778,8 @@ def filter_metrics(args: argparse.Namespace) -> None:
                 "rule_events",
                 "rule_kept",
                 "rule_dropped",
+                "errors",
+                "rule_errors",
             ]
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
@@ -798,6 +848,7 @@ def build_dataset_input(input_dir: Path, output_path: Path, manifest_path: Path,
 
 def run_pipeline(args: argparse.Namespace) -> None:
     run_dir = Path(args.run_dir)
+    args.run_manifest = args.run_manifest or str(run_dir / "run_manifest.json")
     small_name = safe_name(args.small_model)
     filter_output = run_dir / "filter" / small_name / "filtered_events.jsonl"
     filter_checkpoint = run_dir / "filter" / small_name / "checkpoint.json"
@@ -807,13 +858,18 @@ def run_pipeline(args: argparse.Namespace) -> None:
         output=str(filter_output),
         checkpoint=str(filter_checkpoint),
         model=args.small_model,
-        ollama_url=args.ollama_url,
         timeout_seconds=args.filter_timeout_seconds,
         resume=args.resume,
         max_lines=args.max_filter_lines,
         prompt_format=args.prompt_format,
-        pull_missing=args.pull_missing,
-        delete_model_after_use=args.delete_model_after_use,
+        n_ctx=args.n_ctx,
+        n_gpu_layers=args.n_gpu_layers,
+        n_batch=args.n_batch,
+        seed=args.seed,
+        max_output_tokens=args.max_output_tokens,
+        warmup_runs=args.warmup_runs,
+        inference_runs=args.inference_runs,
+        run_manifest=getattr(args, "run_manifest", None),
         log_file=getattr(args, "log_file", None),
         metrics=str(run_dir / "filter" / small_name / "metrics.json"),
         metrics_by_segment=str(run_dir / "filter" / small_name / "metrics_by_segment.csv"),
@@ -830,7 +886,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
             output=str(classify_output),
             checkpoint=str(classify_checkpoint),
             model=model,
-            ollama_url=args.ollama_url,
             timeout_seconds=args.classify_timeout_seconds,
             resume=args.resume,
             include_irrelevant=args.include_irrelevant,
@@ -838,12 +893,54 @@ def run_pipeline(args: argparse.Namespace) -> None:
             max_tokens=args.max_tokens,
             max_segments=args.max_segments,
             prompt_format=args.prompt_format,
-            pull_missing=args.pull_missing,
-            delete_model_after_use=args.delete_model_after_use,
+            n_ctx=args.n_ctx,
+            n_gpu_layers=args.n_gpu_layers,
+            n_batch=args.n_batch,
+            seed=args.seed,
+            max_output_tokens=args.max_output_tokens,
+            warmup_runs=args.warmup_runs,
+            inference_runs=args.inference_runs,
+            run_manifest=getattr(args, "run_manifest", None),
             log_file=getattr(args, "log_file", None),
             progress=args.progress,
         )
         classify_segments(classify_args)
+
+
+def filter_dataset(args: argparse.Namespace) -> None:
+    run_dir = Path(args.run_dir)
+    model_name = safe_name(args.model)
+    input_path = run_dir / "dataset_input" / "all_events.jsonl"
+    build_dataset_input(
+        Path(args.input_dir),
+        input_path,
+        run_dir / "dataset_input" / "manifest.csv",
+        args.rebuild_input,
+    )
+    filter_records(
+        argparse.Namespace(
+            input=str(input_path),
+            output=str(run_dir / "filter" / model_name / "filtered_events.jsonl"),
+            checkpoint=str(run_dir / "filter" / model_name / "checkpoint.json"),
+            metrics=str(run_dir / "filter" / model_name / "metrics.json"),
+            metrics_by_segment=str(run_dir / "filter" / model_name / "metrics_by_segment.csv"),
+            model=args.model,
+            timeout_seconds=args.timeout_seconds,
+            resume=args.resume,
+            max_lines=args.max_lines,
+            progress=args.progress,
+            n_ctx=args.n_ctx,
+            n_gpu_layers=args.n_gpu_layers,
+            n_batch=args.n_batch,
+            seed=args.seed,
+            max_output_tokens=args.max_output_tokens,
+            warmup_runs=args.warmup_runs,
+            inference_runs=args.inference_runs,
+            run_manifest=args.run_manifest or str(run_dir / "run_manifest.json"),
+            log_file=args.log_file,
+            prompt_format=args.prompt_format,
+        )
+    )
 
 
 def run_dataset_pipeline(args: argparse.Namespace) -> None:
@@ -866,9 +963,14 @@ def run_dataset_pipeline(args: argparse.Namespace) -> None:
         filter_timeout_seconds=args.filter_timeout_seconds,
         classify_timeout_seconds=args.classify_timeout_seconds,
         progress=args.progress,
-        ollama_url=args.ollama_url,
-        pull_missing=args.pull_missing,
-        delete_model_after_use=args.delete_model_after_use,
+        n_ctx=args.n_ctx,
+        n_gpu_layers=args.n_gpu_layers,
+        n_batch=args.n_batch,
+        seed=args.seed,
+        max_output_tokens=args.max_output_tokens,
+        warmup_runs=args.warmup_runs,
+        inference_runs=args.inference_runs,
+        run_manifest=getattr(args, "run_manifest", None),
         log_file=getattr(args, "log_file", None),
         prompt_format=args.prompt_format,
     )
@@ -898,6 +1000,7 @@ def migrate_legacy_anchor_state(run_dir: Path, small_name: str, anchors: Path, a
 
 def run_direct_pipeline(args: argparse.Namespace) -> None:
     run_dir = Path(args.run_dir)
+    args.run_manifest = args.run_manifest or str(run_dir / "run_manifest.json")
     small_name = safe_name(args.small_model)
     filter_output = run_dir / "filter" / small_name / "filtered_events.jsonl"
     filter_checkpoint = run_dir / "filter" / small_name / "checkpoint.json"
@@ -914,12 +1017,17 @@ def run_direct_pipeline(args: argparse.Namespace) -> None:
         checkpoint=str(filter_checkpoint),
         anchor_checkpoint=str(anchor_checkpoint),
         model=args.small_model,
-        ollama_url=args.ollama_url,
         timeout_seconds=args.filter_timeout_seconds,
         resume=args.resume,
         prompt_format=args.prompt_format,
-        pull_missing=args.pull_missing,
-        delete_model_after_use=args.delete_model_after_use,
+        n_ctx=args.n_ctx,
+        n_gpu_layers=args.n_gpu_layers,
+        n_batch=args.n_batch,
+        seed=args.seed,
+        max_output_tokens=args.max_output_tokens,
+        warmup_runs=args.warmup_runs,
+        inference_runs=args.inference_runs,
+        run_manifest=getattr(args, "run_manifest", None),
         log_file=getattr(args, "log_file", None),
         metrics=str(run_dir / "filter" / small_name / "metrics.json"),
         metrics_by_segment=str(run_dir / "filter" / small_name / "metrics_by_segment.csv"),
@@ -951,7 +1059,6 @@ def run_direct_pipeline(args: argparse.Namespace) -> None:
             output=str(classify_output),
             checkpoint=str(classify_checkpoint),
             model=model,
-            ollama_url=args.ollama_url,
             timeout_seconds=args.classify_timeout_seconds,
             resume=args.resume,
             include_irrelevant=args.include_irrelevant,
@@ -959,18 +1066,29 @@ def run_direct_pipeline(args: argparse.Namespace) -> None:
             max_tokens=args.max_tokens,
             max_segments=args.max_classify_segments,
             prompt_format=args.prompt_format,
-            pull_missing=args.pull_missing,
-            delete_model_after_use=args.delete_model_after_use,
+            n_ctx=args.n_ctx,
+            n_gpu_layers=args.n_gpu_layers,
+            n_batch=args.n_batch,
+            seed=args.seed,
+            max_output_tokens=args.max_output_tokens,
+            warmup_runs=args.warmup_runs,
+            inference_runs=args.inference_runs,
+            run_manifest=getattr(args, "run_manifest", None),
             log_file=getattr(args, "log_file", None),
             progress=args.progress,
         )
         classify_segments(classify_args)
 
 
-def add_common_ollama_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--ollama-url", default="http://localhost:11434")
-    parser.add_argument("--pull-missing", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--delete-model-after-use", action="store_true")
+def add_common_llama_cpp_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--n-ctx", type=int, default=4096)
+    parser.add_argument("--n-gpu-layers", type=int, default=-1, help="Number of layers offloaded to GPU; -1 means all.")
+    parser.add_argument("--n-batch", type=int, default=512)
+    parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--max-output-tokens", type=int, default=512)
+    parser.add_argument("--warmup-runs", type=int, default=1)
+    parser.add_argument("--inference-runs", type=int, default=1)
+    parser.add_argument("--run-manifest")
     parser.add_argument("--log-file")
     parser.add_argument("--prompt-format", choices=("csv", "json"), default="csv")
 
@@ -979,7 +1097,7 @@ def default_log_file(args: argparse.Namespace) -> Path | None:
     command = getattr(args, "command", "")
     if getattr(args, "log_file", None):
         return Path(args.log_file)
-    if command in {"run", "run-dataset", "run-direct"}:
+    if command in {"run", "filter-dataset", "run-dataset", "run-direct"}:
         return Path(args.run_dir) / "pipeline.log"
     output = getattr(args, "output", None)
     if output:
@@ -1029,7 +1147,7 @@ def build_parser() -> argparse.ArgumentParser:
     filter_cmd.add_argument("--metrics")
     filter_cmd.add_argument("--metrics-by-segment")
     filter_cmd.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
-    add_common_ollama_args(filter_cmd)
+    add_common_llama_cpp_args(filter_cmd)
     filter_cmd.set_defaults(func=filter_records)
 
     extract_filter_cmd = sub.add_parser(
@@ -1054,11 +1172,13 @@ def build_parser() -> argparse.ArgumentParser:
     extract_filter_cmd.add_argument("--metrics-every", type=int, default=100)
     extract_filter_cmd.add_argument("--max-lines", type=int)
     extract_filter_cmd.add_argument("--max-filter-records", type=int)
-    extract_filter_cmd.add_argument("--keep-dropped", action="store_true")
+    extract_filter_cmd.add_argument(
+        "--keep-dropped", action="store_true", help="Deprecated: all records are always preserved."
+    )
     extract_filter_cmd.add_argument("--metrics")
     extract_filter_cmd.add_argument("--metrics-by-segment")
     extract_filter_cmd.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
-    add_common_ollama_args(extract_filter_cmd)
+    add_common_llama_cpp_args(extract_filter_cmd)
     extract_filter_cmd.set_defaults(func=extract_filter, require_existing_anchors=True, rebuild_anchors=False)
 
     classify_cmd = sub.add_parser("classify", help="Run the robust LLM classification stage.")
@@ -1073,7 +1193,7 @@ def build_parser() -> argparse.ArgumentParser:
     classify_cmd.add_argument("--max-tokens", type=int, default=1500)
     classify_cmd.add_argument("--max-segments", type=int)
     classify_cmd.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
-    add_common_ollama_args(classify_cmd)
+    add_common_llama_cpp_args(classify_cmd)
     classify_cmd.set_defaults(func=classify_segments)
 
     run_cmd = sub.add_parser("run", help="Run one small filtering model and N large classifiers.")
@@ -1090,8 +1210,23 @@ def build_parser() -> argparse.ArgumentParser:
     run_cmd.add_argument("--filter-timeout-seconds", type=int, default=120)
     run_cmd.add_argument("--classify-timeout-seconds", type=int, default=180)
     run_cmd.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
-    add_common_ollama_args(run_cmd)
+    add_common_llama_cpp_args(run_cmd)
     run_cmd.set_defaults(func=run_pipeline)
+
+    filter_dataset_cmd = sub.add_parser(
+        "filter-dataset",
+        help="Build the materialized dataset input and run only the lightweight filtering stage.",
+    )
+    filter_dataset_cmd.add_argument("--input-dir", default="dataset/processed")
+    filter_dataset_cmd.add_argument("--run-dir", required=True)
+    filter_dataset_cmd.add_argument("--model", required=True)
+    filter_dataset_cmd.add_argument("--resume", action="store_true")
+    filter_dataset_cmd.add_argument("--rebuild-input", action="store_true")
+    filter_dataset_cmd.add_argument("--max-lines", type=int)
+    filter_dataset_cmd.add_argument("--timeout-seconds", type=int, default=120)
+    filter_dataset_cmd.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
+    add_common_llama_cpp_args(filter_dataset_cmd)
+    filter_dataset_cmd.set_defaults(func=filter_dataset)
 
     run_dataset_cmd = sub.add_parser(
         "run-dataset",
@@ -1111,7 +1246,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_dataset_cmd.add_argument("--filter-timeout-seconds", type=int, default=120)
     run_dataset_cmd.add_argument("--classify-timeout-seconds", type=int, default=180)
     run_dataset_cmd.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
-    add_common_ollama_args(run_dataset_cmd)
+    add_common_llama_cpp_args(run_dataset_cmd)
     run_dataset_cmd.set_defaults(func=run_dataset_pipeline)
 
     run_direct_cmd = sub.add_parser(
@@ -1125,7 +1260,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_direct_cmd.add_argument("--big-model", action="append", required=True)
     run_direct_cmd.add_argument("--resume", action="store_true")
     run_direct_cmd.add_argument("--include-irrelevant", action="store_true")
-    run_direct_cmd.add_argument("--keep-dropped", action="store_true")
+    run_direct_cmd.add_argument(
+        "--keep-dropped", action="store_true", help="Deprecated: all records are always preserved."
+    )
     run_direct_cmd.add_argument("--before-seconds", type=int, default=60)
     run_direct_cmd.add_argument("--after-seconds", type=int, default=60)
     run_direct_cmd.add_argument("--same-host", action=argparse.BooleanOptionalAction, default=True)
@@ -1141,7 +1278,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_direct_cmd.add_argument("--filter-timeout-seconds", type=int, default=120)
     run_direct_cmd.add_argument("--classify-timeout-seconds", type=int, default=180)
     run_direct_cmd.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
-    add_common_ollama_args(run_direct_cmd)
+    add_common_llama_cpp_args(run_direct_cmd)
     run_direct_cmd.set_defaults(func=run_direct_pipeline)
 
     metrics_cmd = sub.add_parser("filter-metrics", help="Measure whether filtering kept rule-labelled events.")
@@ -1170,6 +1307,20 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    if (
+        getattr(args, "warmup_runs", 0) < 0
+        or getattr(args, "inference_runs", 1) < 1
+        or getattr(args, "max_output_tokens", 1) < 1
+    ):
+        parser.error("--warmup-runs must be >= 0; --inference-runs and --max-output-tokens must be >= 1")
+    try:
+        for name in ("model", "small_model"):
+            if model := getattr(args, name, None):
+                parse_model_ref(model)
+        for model in getattr(args, "big_model", []) or []:
+            parse_model_ref(model)
+    except ValueError as exc:
+        parser.error(str(exc))
     setup_logging(args)
     args.func(args)
 

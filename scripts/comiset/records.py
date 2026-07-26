@@ -5,6 +5,8 @@ import io
 import json
 from typing import Any
 
+from comiset.privacy import sanitize_llm_event
+
 
 CSV_FIELDS = (
     "event_line",
@@ -39,7 +41,7 @@ def is_relevant(record: dict[str, Any]) -> bool:
 
 def llm_event(record: dict[str, Any]) -> dict[str, Any]:
     value = record.get("llm_event")
-    return value if isinstance(value, dict) else {}
+    return sanitize_llm_event(value) if isinstance(value, dict) else {}
 
 
 def event_value(event: dict[str, Any], *keys: str) -> Any:
@@ -120,6 +122,51 @@ def chunk_to_prompt_payload(records: list[dict[str, Any]], prompt_format: str) -
     if prompt_format == "csv":
         return rows_to_csv([event_to_csv_row(record) for record in records])
     return json.dumps([llm_event(record) for record in records], ensure_ascii=False)
+
+
+def aggregate_chunk_results(chunks: list[dict[str, Any]], empty_segment: bool = False) -> dict[str, Any]:
+    if empty_segment:
+        return {
+            "strategy": "majority",
+            "status": "empty_after_filter",
+            "classification": "Not Interesting",
+            "interesting_votes": 0,
+            "not_interesting_votes": 0,
+            "invalid_votes": 0,
+            "tie_breaker": "Not Interesting",
+        }
+
+    interesting = 0
+    not_interesting = 0
+    invalid = 0
+    for chunk in chunks:
+        if chunk.get("error") or chunk.get("parse_error"):
+            invalid += 1
+            continue
+        value = str(chunk.get("classification", "")).strip().lower()
+        if value == "interesting":
+            interesting += 1
+        elif value == "not interesting":
+            not_interesting += 1
+        else:
+            invalid += 1
+
+    valid = interesting + not_interesting
+    if not valid:
+        classification = None
+        status = "error"
+    else:
+        classification = "Interesting" if interesting > not_interesting else "Not Interesting"
+        status = "ok" if interesting != not_interesting else "tie"
+    return {
+        "strategy": "majority",
+        "status": status,
+        "classification": classification,
+        "interesting_votes": interesting,
+        "not_interesting_votes": not_interesting,
+        "invalid_votes": invalid,
+        "tie_breaker": "Not Interesting",
+    }
 
 
 def event_has_hidden_rule(record: dict[str, Any]) -> bool:

@@ -6,7 +6,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from comiset.records import event_has_hidden_rule, is_relevant, segment_technique_ids
+from comiset.records import aggregate_chunk_results, event_has_hidden_rule, is_relevant, segment_technique_ids
 
 
 CONFUSION_FIELDS = ("tp", "fp", "fn", "tn")
@@ -125,7 +125,14 @@ def filter_error_record(record: dict[str, Any], outcome: str) -> dict[str, Any]:
     }
 
 
+def filter_result_has_error(record: dict[str, Any]) -> bool:
+    result = record.get("filter_result", {})
+    return bool(isinstance(result, dict) and (result.get("error") or result.get("parse_error")))
+
+
 def filter_outcome(record: dict[str, Any]) -> str:
+    if filter_result_has_error(record):
+        return "error"
     truth = event_has_hidden_rule(record)
     predicted = is_relevant(record)
     if truth and predicted:
@@ -143,6 +150,7 @@ def filter_report(input_path: Path, output_dir: Path) -> dict[str, str]:
     confusion_rows: list[dict[str, Any]] = []
     false_negatives: list[dict[str, Any]] = []
     false_positives: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
     timings: list[float] = []
     parse_errors = 0
     inference_errors = 0
@@ -155,7 +163,8 @@ def filter_report(input_path: Path, output_dir: Path) -> dict[str, str]:
             processed += 1
             record = json.loads(raw_line)
             outcome = filter_outcome(record)
-            counts[outcome] += 1
+            if outcome in counts:
+                counts[outcome] += 1
             result = record.get("filter_result", {})
             elapsed = result.get("elapsed_seconds") if isinstance(result, dict) else None
             if isinstance(elapsed, int | float):
@@ -173,9 +182,13 @@ def filter_report(input_path: Path, output_dir: Path) -> dict[str, str]:
                     "technique_ids": ",".join(segment_technique_ids(record)),
                     "technique_names": ",".join(label_names(record)),
                     **{key: 0 for key in CONFUSION_FIELDS},
+                    "errors": 0,
                 },
             )
-            segment[outcome] += 1
+            if outcome in CONFUSION_FIELDS:
+                segment[outcome] += 1
+            else:
+                segment["errors"] += 1
             row = {
                 "outcome": outcome,
                 "truth_malicious": event_has_hidden_rule(record),
@@ -197,11 +210,16 @@ def filter_report(input_path: Path, output_dir: Path) -> dict[str, str]:
                 false_negatives.append(filter_error_record(record, outcome))
             elif outcome == "fp":
                 false_positives.append(filter_error_record(record, outcome))
+            elif outcome == "error":
+                errors.append(filter_error_record(record, outcome))
 
     metrics = {
         **confusion_metrics(counts["tp"], counts["fp"], counts["fn"], counts["tn"]),
         "input": str(input_path),
         "processed_records": processed,
+        "scored_records": sum(counts.values()),
+        "unscored_records": len(errors),
+        "coverage": safe_div(sum(counts.values()), processed),
         "parse_errors": parse_errors,
         "inference_errors": inference_errors,
         "parse_error_rate": safe_div(parse_errors, processed),
@@ -215,6 +233,7 @@ def filter_report(input_path: Path, output_dir: Path) -> dict[str, str]:
     timing_path = output_dir / "filter_timing.csv"
     false_negatives_path = output_dir / "filter_false_negatives.jsonl"
     false_positives_path = output_dir / "filter_false_positives.jsonl"
+    errors_path = output_dir / "filter_errors.jsonl"
 
     atomic_write_json(metrics_path, metrics)
     write_csv(
@@ -252,6 +271,7 @@ def filter_report(input_path: Path, output_dir: Path) -> dict[str, str]:
             "fp",
             "fn",
             "tn",
+            "errors",
             "total",
             "precision",
             "recall",
@@ -266,6 +286,7 @@ def filter_report(input_path: Path, output_dir: Path) -> dict[str, str]:
     write_csv(timing_path, list(timing.keys()), [timing])
     write_jsonl(false_negatives_path, false_negatives)
     write_jsonl(false_positives_path, false_positives)
+    write_jsonl(errors_path, errors)
     return {
         "metrics": str(metrics_path),
         "confusion": str(confusion_path),
@@ -273,6 +294,7 @@ def filter_report(input_path: Path, output_dir: Path) -> dict[str, str]:
         "timing": str(timing_path),
         "false_negatives": str(false_negatives_path),
         "false_positives": str(false_positives_path),
+        "errors": str(errors_path),
     }
 
 
@@ -284,11 +306,24 @@ def is_interesting(value: Any) -> bool:
     return False
 
 
+def classification_prediction(record: dict[str, Any]) -> bool | None:
+    result = record.get("classification_result", {})
+    if not isinstance(result, dict):
+        return None
+    aggregate = result.get("aggregate")
+    if not isinstance(aggregate, dict):
+        chunks = [chunk for chunk in result.get("chunks", []) if isinstance(chunk, dict)]
+        aggregate = aggregate_chunk_results(chunks, empty_segment=not chunks)
+    if aggregate.get("status") == "error":
+        return None
+    return is_interesting(aggregate.get("classification"))
+
+
 def classification_outcome(record: dict[str, Any]) -> str:
     truth = bool(segment_technique_ids(record))
-    result = record.get("classification_result", {})
-    chunks = result.get("chunks", []) if isinstance(result, dict) else []
-    predicted = any(is_interesting(chunk.get("classification")) for chunk in chunks if isinstance(chunk, dict))
+    predicted = classification_prediction(record)
+    if predicted is None:
+        return "error"
     if truth and predicted:
         return "tp"
     if truth and not predicted:
@@ -314,7 +349,7 @@ def classification_detail_record(record: dict[str, Any], outcome: str) -> dict[s
 def classify_report(input_path: Path, output_dir: Path) -> dict[str, str]:
     counts = {key: 0 for key in CONFUSION_FIELDS}
     rows: list[dict[str, Any]] = []
-    details = {key: [] for key in CONFUSION_FIELDS}
+    details = {key: [] for key in (*CONFUSION_FIELDS, "error")}
     chunk_timings: list[float] = []
     segment_timings: list[float] = []
     parse_errors = 0
@@ -329,7 +364,8 @@ def classify_report(input_path: Path, output_dir: Path) -> dict[str, str]:
             processed += 1
             record = json.loads(raw_line)
             outcome = classification_outcome(record)
-            counts[outcome] += 1
+            if outcome in counts:
+                counts[outcome] += 1
             result = record.get("classification_result", {})
             chunks = result.get("chunks", []) if isinstance(result, dict) else []
             total_chunks += len(chunks)
@@ -343,7 +379,7 @@ def classify_report(input_path: Path, output_dir: Path) -> dict[str, str]:
             segment_timings.append(segment_elapsed)
             parse_errors += sum(1 for chunk in chunks if isinstance(chunk, dict) and chunk.get("parse_error"))
             inference_errors += sum(1 for chunk in chunks if isinstance(chunk, dict) and chunk.get("error"))
-            predicted = any(is_interesting(chunk.get("classification")) for chunk in chunks if isinstance(chunk, dict))
+            predicted = classification_prediction(record)
             confidences = [
                 float(chunk["confidence"])
                 for chunk in chunks
@@ -377,6 +413,8 @@ def classify_report(input_path: Path, output_dir: Path) -> dict[str, str]:
         "input": str(input_path),
         "processed_segments": processed,
         "processed_chunks": total_chunks,
+        "scored_segments": sum(counts.values()),
+        "unscored_segments": len(details["error"]),
         "parse_errors": parse_errors,
         "inference_errors": inference_errors,
         "parse_error_rate": safe_div(parse_errors, total_chunks),
@@ -427,6 +465,7 @@ def classify_report(input_path: Path, output_dir: Path) -> dict[str, str]:
         ("fp", "classification_false_positives.jsonl"),
         ("tp", "classification_true_positives.jsonl"),
         ("tn", "classification_true_negatives.jsonl"),
+        ("error", "classification_errors.jsonl"),
     ):
         path = output_dir / name
         write_jsonl(path, details[outcome])
@@ -442,6 +481,8 @@ def empty_filter_totals() -> dict[str, int]:
         "rule_events": 0,
         "rule_kept": 0,
         "rule_dropped": 0,
+        "errors": 0,
+        "rule_errors": 0,
     }
 
 
@@ -452,13 +493,17 @@ def update_filter_metrics(
 ) -> None:
     relevant = is_relevant(record)
     has_rule = event_has_hidden_rule(record)
+    has_error = filter_result_has_error(record)
 
     totals["events"] += 1
-    totals["kept"] += int(relevant)
-    totals["dropped"] += int(not relevant)
     totals["rule_events"] += int(has_rule)
-    totals["rule_kept"] += int(has_rule and relevant)
-    totals["rule_dropped"] += int(has_rule and not relevant)
+    totals["errors"] += int(has_error)
+    totals["rule_errors"] += int(has_rule and has_error)
+    if not has_error:
+        totals["kept"] += int(relevant)
+        totals["dropped"] += int(not relevant)
+        totals["rule_kept"] += int(has_rule and relevant)
+        totals["rule_dropped"] += int(has_rule and not relevant)
 
     segment = by_segment.setdefault(
         record["segment_id"],
@@ -473,25 +518,33 @@ def update_filter_metrics(
             "rule_events": 0,
             "rule_kept": 0,
             "rule_dropped": 0,
+            "errors": 0,
+            "rule_errors": 0,
         },
     )
     segment["events"] += 1
-    segment["kept"] += int(relevant)
-    segment["dropped"] += int(not relevant)
     segment["rule_events"] += int(has_rule)
-    segment["rule_kept"] += int(has_rule and relevant)
-    segment["rule_dropped"] += int(has_rule and not relevant)
+    segment["errors"] += int(has_error)
+    segment["rule_errors"] += int(has_rule and has_error)
+    if not has_error:
+        segment["kept"] += int(relevant)
+        segment["dropped"] += int(not relevant)
+        segment["rule_kept"] += int(has_rule and relevant)
+        segment["rule_dropped"] += int(has_rule and not relevant)
 
 
 def filter_metrics_summary(totals: dict[str, int], segment_count: int, output: Path | None = None) -> dict[str, Any]:
-    rule_events = totals["rule_events"]
+    scored_events = totals["events"] - totals["errors"]
+    scored_rule_events = totals["rule_events"] - totals["rule_errors"]
     return {
         **totals,
         "segments": segment_count,
-        "keep_rate": (totals["kept"] / totals["events"]) if totals["events"] else None,
-        "drop_rate": (totals["dropped"] / totals["events"]) if totals["events"] else None,
-        "rule_recall_after_filter": (totals["rule_kept"] / rule_events) if rule_events else None,
-        "rule_drop_rate": (totals["rule_dropped"] / rule_events) if rule_events else None,
+        "scored_events": scored_events,
+        "coverage": (scored_events / totals["events"]) if totals["events"] else None,
+        "keep_rate": (totals["kept"] / scored_events) if scored_events else None,
+        "drop_rate": (totals["dropped"] / scored_events) if scored_events else None,
+        "rule_recall_after_filter": (totals["rule_kept"] / scored_rule_events) if scored_rule_events else None,
+        "rule_drop_rate": (totals["rule_dropped"] / scored_rule_events) if scored_rule_events else None,
         "output": str(output) if output else None,
     }
 
@@ -524,6 +577,8 @@ def write_filter_metrics(
             "rule_events",
             "rule_kept",
             "rule_dropped",
+            "errors",
+            "rule_errors",
         ]
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
@@ -549,7 +604,16 @@ def load_filter_metrics(
         for row in reader:
             segment_id = row["segment_id"]
             parsed = dict(row)
-            for key in ("events", "kept", "dropped", "rule_events", "rule_kept", "rule_dropped"):
+            for key in (
+                "events",
+                "kept",
+                "dropped",
+                "rule_events",
+                "rule_kept",
+                "rule_dropped",
+                "errors",
+                "rule_errors",
+            ):
                 parsed[key] = int(parsed.get(key, 0) or 0)
             parsed["anchor_line"] = int(parsed["anchor_line"]) if parsed.get("anchor_line") else None
             by_segment[segment_id] = parsed
