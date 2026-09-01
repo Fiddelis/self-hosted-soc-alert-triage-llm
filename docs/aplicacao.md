@@ -169,11 +169,15 @@ Opções comuns:
 
 | Opção | Padrão | Efeito |
 |---|---:|---|
-| `--n-ctx` | `4096` | Janela de contexto do modelo. |
+| `--n-ctx` | `4096` | Janela do filtro; no comando `classify`, o padrão é `8192`. |
+| `--classify-n-ctx` | `8192` | Janela dos modelos grandes nos comandos combinados. |
 | `--n-gpu-layers` | `-1` | Tenta descarregar todas as camadas na GPU; `0` força CPU. |
-| `--n-batch` | `512` | Batch lógico usado no processamento do prompt. |
+| `--n-batch` | `512` | Batch lógico usado no processamento do prompt; não paraleliza eventos. |
 | `--seed` | `2026` | Seed da inicialização e geração. |
-| `--max-output-tokens` | `512` | Limite da resposta do modelo. |
+| `--max-output-tokens` | `512` | Limite do filtro; no comando `classify`, o padrão é `256`. |
+| `--classify-max-output-tokens` | `256` | Limite dos modelos grandes nos comandos combinados. |
+| `--max-tokens` | `5000` | Orçamento aproximado de entrada por chunk de classificação. |
+| `--thinking-mode` | `auto` | `auto`, `think` ou `no_think` para a classificação. |
 | `--warmup-runs` | `1` | Inferências de aquecimento fora das métricas. |
 | `--inference-runs` | `1` | Repetições medidas de cada prompt. |
 | `--run-manifest` | automático | Caminho opcional do manifesto reproduzível. |
@@ -313,8 +317,11 @@ uv run python scripts/comiset_llm_pipeline.py run-dataset \
   --small-model bartowski/Llama-3.2-3B-Instruct-GGUF:Llama-3.2-3B-Instruct-Q4_K_M.gguf \
   --big-model bartowski/DeepSeek-R1-Distill-Qwen-14B-GGUF:DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf \
   --big-model Qwen/Qwen3-14B-GGUF:Qwen3-14B-Q4_K_M.gguf \
-  --max-tokens 1500 \
+  --max-tokens 5000 \
   --n-ctx 4096 \
+  --classify-n-ctx 8192 \
+  --classify-max-output-tokens 256 \
+  --thinking-mode auto \
   --n-gpu-layers -1 \
   --prompt-format csv
 ```
@@ -343,6 +350,11 @@ Use `--rebuild-input` somente se os arquivos de `dataset/processed/` tiverem mud
 | `filter-report` | saída filtrada completa | métricas detalhadas e erros do filtro |
 | `classify-report` | classificações | métricas e erros da classificação |
 
+Para uma condição adicional sem filtragem, o subcomando `classify` pode receber
+diretamente o `dataset_input/all_events.jsonl` com `--include-irrelevant`. O wrapper
+HPC expõe essa execução como modo `raw`, gravando os resultados em uma pasta separada;
+ela é uma ablação do benchmark filtrado e não substitui o fluxo padrão.
+
 ## 9. Funcionamento da inferência
 
 ### 9.1 Filtragem
@@ -357,13 +369,36 @@ O resultado é adicionado em `filter_result`. Todos os eventos são preservados,
 
 ### 9.2 Serialização CSV e JSON
 
-CSV é o padrão por consumir menos caracteres. Ele possui colunas normalizadas para horário, host, usuário, processo, pai, evento, regra, command line e mensagem. JSON preserva o conteúdo completo de `llm_event`.
+A filtragem continua recebendo o evento completo sanitizado. Somente a classificação usa uma representação compacta, igual para todos os modelos grandes:
+
+- remove `process_guid` do CSV de classificação;
+- transforma `event_original_message` em detalhes `chave=valor` separados por `;`;
+- remove `CallTrace`, GUIDs, horário/regra e IDs de origem já representados nas colunas normalizadas;
+- limita cada valor ou linha não estruturada a 512 caracteres;
+- preserva imagens/processos de origem e destino, usuários, acesso concedido, command lines, arquivos, objetos de registro, rede e demais detalhes não removidos;
+- aplica a mesma compactação à mensagem quando `--prompt-format json` é usado.
+
+A sanitização de rótulos ocorre antes da compactação. O JSON de classificação preserva os demais campos de `llm_event`; o CSV usa colunas normalizadas para horário, host, usuário, processo, pai, evento, regra, command line e detalhes.
+
+Na amostra de 49.800 eventos, a mensagem caiu em média de aproximadamente 949 para 250 caracteres. Considerando todos os 200 eventos de cada segmento como retidos, a configuração antiga (`1500`, payload integral e cabeçalho superestimado) produzia 13.927 chunks; a compactação com `5000` produziu 1.219. Essa é uma estimativa de limite superior: a quantidade real depende das decisões de cada filtro.
 
 ### 9.3 Chunking
 
-Os eventos mantidos são agrupados por `segment_id`. O tamanho é estimado por `max_tokens * 4` caracteres. Cada chunk repete cabeçalho e metadados do segmento e é classificado separadamente.
+Os eventos mantidos são agrupados por `segment_id`. A pré-divisão inicial usa
+`max_tokens * 4` caracteres para evitar construir chunks excessivos, mas cada
+chunk é verificado antes da inferência com a tokenização disponível no gateway.
+O orçamento seguro é `n_ctx - max_output_tokens - margem`; quando o limite é
+excedido, o chunk é dividido antes da chamada. O cabeçalho CSV é contado uma vez
+por chunk, como ocorre no payload efetivo. Cada chunk repete os metadados do
+segmento e é classificado separadamente.
 
-### 9.4 Classificação
+O filtro usa `n_ctx=4096` e saída de até 512 tokens. Os classificadores usam por
+padrão `n_ctx=8192` e saída de até 256 tokens. Esses orçamentos são separados nos
+comandos combinados por `--classify-n-ctx` e `--classify-max-output-tokens`. Um
+chunk que ainda não caiba individualmente vira erro operacional e não é enviado
+como uma decisão negativa.
+
+### 9.4 Classificação e modo de raciocínio
 
 Resposta esperada:
 
@@ -371,15 +406,31 @@ Resposta esperada:
 {"classification": "Interesting", "confidence": 0.9, "reason": "..."}
 ```
 
+`--thinking-mode` controla uma diretiva no início do prompt do classificador:
+
+- `auto`: não adiciona diretiva e preserva o comportamento do chat template;
+- `think`: adiciona `/think`;
+- `no_think`: adiciona `/no_think`.
+
+O switch textual é oficialmente suportado pelo Qwen3, conforme a seção *Switching Between Thinking and Non-Thinking Mode* do [model card oficial](https://huggingface.co/Qwen/Qwen3-14B). O [model card do DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-14B) não documenta um hard switch equivalente; nele, `think`/`no_think` são condições experimentais de prompt e não garantem ativação/desativação interna. Temperatura, seed e limite de saída permanecem iguais entre modos para permitir comparação controlada. O modo fica no diretório de saída, checkpoint, `classification_result` e `run_manifest.json`; modos diferentes não compartilham checkpoint. O limite de 256 tokens pode truncar raciocínio extenso em `think`; cobertura e erros de parse devem ser reportados por modo.
+
 A decisão consolidada usa **votação por maioria** entre chunks válidos. Chunks com erro se abstêm; empate resulta em `Not Interesting`. Um segmento sem nenhum evento após o filtro recebe `empty_after_filter` e `Not Interesting`, portanto continua no denominador como FN ou TN. Se todos os chunks falharem, o segmento recebe estado operacional `error` e não é convertido em classe negativa.
 
 ### 9.5 Parse de respostas
 
-O parser tenta, nesta ordem:
+O gateway solicita `response_format={"type": "json_object"}` ao
+`llama-cpp-python`. O parser tenta, nesta ordem:
 
 1. interpretar toda a resposta como JSON;
 2. localizar o primeiro bloco entre chaves e interpretá-lo;
 3. registrar `parse_error` e a resposta bruta.
+
+Depois do parsing, a resposta é validada por etapa. A filtragem exige
+`relevant`, `confidence` e `reason`; a classificação exige `classification`,
+`confidence` e `reason`, com valores e tipos válidos. `finish_reason` diferente
+de `stop`, resposta vazia, JSON incompleto ou campo inválido vira erro
+operacional. O gateway também registra `finish_reason`, `prompt_tokens`,
+`completion_tokens` e `total_tokens` quando fornecidos pelo runtime.
 
 Erros de inferência e parse são preservados como estado operacional. As métricas informam cobertura, itens pontuados e não pontuados, sem transformar falha em decisão negativa.
 
@@ -393,7 +444,11 @@ Regras práticas:
 - não misture resultados de modelos/quantizações diferentes;
 - não altere o JSONL de entrada durante uma execução;
 - em ZIP comprimido, a retomada ainda percorre o fluxo até a linha salva;
-- checkpoint `done` faz o comando retornar sem reprocessar.
+- na classificação, o JSONL validado e efetivamente gravado é a fonte da posição de retomada;
+- filtro e classificação descarregam (`flush`) a saída antes do checkpoint para impedir que o checkpoint avance além dos resultados duráveis;
+- a retomada valida JSONL, chaves, ordem e quantidade de registros duráveis antes de continuar;
+- divergência entre checkpoint e JSONL nunca pula registros ausentes;
+- checkpoint `done` só faz o comando retornar quando a saída também satisfaz a validação esperada.
 
 ## 11. Saídas
 
@@ -430,7 +485,18 @@ runs/final/
     classification_true_positives.jsonl
     classification_true_negatives.jsonl
     classification_errors.jsonl
+  classify/raw/<modelo-grande>/
+    classifications.jsonl
+    checkpoint.json
+    classification_metrics.json
+  classify/<modelo-grande>/
+    sources.json
 ```
+
+O comando `classify-model` executa a baseline raw e todas as filtragens completas
+com o mesmo modelo grande carregado. O raw usa `include_irrelevant=True`; cada
+filtragem usa somente eventos com decisão positiva, mas um erro de filtragem marca
+o segmento como não pontuado em vez de criar uma decisão negativa.
 
 Os nomes das pastas são derivados da referência completa do modelo por `safe_name`; caracteres como `/` e `:` tornam-se `_`.
 
@@ -509,15 +575,16 @@ Esta seção registra os riscos encontrados e o estado das correções. Itens ma
 6. **Timeout não funciona na inferência local.** `timeout_seconds` é descartado pelo gateway; um modelo travado não é interrompido.
 7. **Janelas fixas por linha não equivalem a ±60 segundos.** No material atual, 200 linhas podem cobrir de 0 até 12.776 segundos no lab e até 3.861 segundos no real. Isso deve ser assumido explicitamente pelo protocolo.
 8. **Amostra real limitada a uma região inicial do prefixo de 2 GiB.** O scanner para após encontrar os primeiros 1.000 blocos limpos; a seleção dos 200 não representa uniformemente o arquivo COMISET real completo de 914 GB.
-9. **Chunking não usa o tokenizer real.** A regra de quatro caracteres por token pode exceder ou subutilizar `n_ctx`; cabeçalhos e tokens de saída não entram precisamente no orçamento.
+9. **[PARCIALMENTE RESOLVIDO] Chunking e tokenizer.** A regra de quatro caracteres por token continua sendo apenas uma pré-divisão; antes da chamada o gateway conta tokens de entrada, reserva saída e margem de segurança e divide chunks que excedem o orçamento. A contagem ainda não incorpora integralmente todo overhead do chat template, por isso uma margem conservadora permanece necessária.
 10. **[RESOLVIDO] Identidade e ambiente da execução.** `run_manifest.json` registra revisão solicitada/resolvida, SHA-256 e tamanho do GGUF, metadados de quantização, hash do chat template, versões, backend, hardware, parâmetros, hashes de prompts e artefatos de entrada/saída.
 11. **[RESOLVIDO] Erros separados de decisões.** Filtro e classificação registram falhas como itens não pontuados, com cobertura explícita e arquivos `*_errors.jsonl`; falha operacional não entra como classe negativa.
 
 ### Médios
 
-12. **CSV descarta campos extraídos.** `file.path`, `winlog.task` e `Task` fazem parte de `DEFAULT_KEEP_FIELDS`, mas não possuem colunas no payload CSV. O formato JSON e o CSV analisam contextos diferentes.
+12. **Compactação altera o contexto dos classificadores.** O CSV descarta campos extraídos (`file.path`, `winlog.task` e `Task`) e a classificação remove `CallTrace`, GUIDs e duplicatas da mensagem. Isso reduz custo, mas pode remover evidência útil; JSON e CSV também preservam conjuntos diferentes de campos fora da mensagem compactada. Resultados anteriores à compactação não são comparáveis diretamente.
 13. **Ground truth da filtragem é estreito.** Uma linha contextual sem regra pode ser relevante para investigação, mas é considerada negativa nas métricas de evento. Assim, FP/FN do filtro não equivalem diretamente a relevância analítica humana.
 14. **Sobreposição no lab.** Existem 3 pares de janelas de linha sobrepostas e 317 `event_id`s repetidos entre segmentos. Isso cria dependência entre amostras.
 15. **`run-direct` não cria negativos por conta própria.** Quando executado apenas sobre âncoras MITRE do lab, não é adequado para medir especificidade/acurácia de classificação.
-16. **Cobertura de testes ainda parcial.** Agora há testes de seleção limpa do real, ocultação de rótulos, geometria, segmentos vazios, denominador de 249 segmentos, maioria/empate/erros, revisão de modelo e separação de preparação/warm-up. Retomada e chunking com tokenizer real ainda não estão cobertos.
-17. **Metadados do pacote estão incompletos.** `pyproject.toml` ainda usa a descrição placeholder `Add your description here`.
+16. **Cobertura de testes ainda parcial.** Há testes de seleção limpa do real, ocultação de rótulos inclusive após compactação, geometria, segmentos vazios, denominador de 249 segmentos, maioria/empate/erros, revisão de modelo, separação de preparação/warm-up, cabeçalho de chunk, resposta JSON estruturada, validação de filtragem, integração raw + filtrado e retomada quando o checkpoint está à frente da saída. A contagem de tokens real em cada família de GGUF ainda deve ser confirmada por smoke test HPC.
+17. **Modos de raciocínio não são equivalentes entre famílias.** Qwen3 documenta `/think` e `/no_think`, mas DeepSeek-R1-Distill-Qwen não oferece o mesmo hard switch. Além disso, o Qwen3 recomenda amostragem para `think`, enquanto o benchmark mantém temperatura zero para comparabilidade. Resultados devem identificar família, modo, limite de saída e taxa de parse; `no_think` do DeepSeek deve ser descrito como condição experimental de prompt.
+18. **Metadados do pacote estão incompletos.** `pyproject.toml` ainda usa a descrição placeholder `Add your description here`.

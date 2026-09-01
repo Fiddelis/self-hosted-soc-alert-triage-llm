@@ -55,6 +55,7 @@ class GatewayPreparationTests(unittest.TestCase):
         self.assertEqual(manifest["setup_timing"]["warmup_runs"], 1)
         self.assertEqual(manifest["configuration"]["seed"], 7)
         self.assertEqual(calls[-1][1]["max_tokens"], 32)
+        self.assertEqual(calls[-1][1]["response_format"], {"type": "json_object"})
 
 
 if __name__ == "__main__":

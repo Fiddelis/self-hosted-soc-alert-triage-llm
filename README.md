@@ -85,9 +85,36 @@ uv run python scripts/comiset_llm_pipeline.py run-dataset \
   --big-model Qwen/Qwen3-14B-GGUF:Qwen3-14B-Q4_K_M.gguf \
   --big-model bartowski/phi-4-GGUF:phi-4-Q4_K_M.gguf \
   --big-model bartowski/Mistral-Nemo-Instruct-2407-GGUF:Mistral-Nemo-Instruct-2407-Q4_K_M.gguf \
-  --max-tokens 1500 \
+  --max-tokens 5000 \
+  --classify-n-ctx 8192 \
+  --classify-max-output-tokens 256 \
+  --thinking-mode auto \
   --prompt-format csv
 ```
+
+O `run-dataset` agora classifica também `dataset_input/all_events.jsonl` como
+baseline raw, uma única vez por modelo grande/modo, além da saída filtrada. Para
+classificar todas as filtragens já concluídas de um diretório HPC com uma única
+carga do modelo grande, use:
+
+```bash
+uv run python scripts/comiset_llm_pipeline.py classify-model \
+  --input-dir dataset/processed \
+  --run-dir runs/hpc-final \
+  --big-model bartowski/DeepSeek-R1-Distill-Qwen-14B-GGUF:DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf \
+  --n-ctx 8192 \
+  --max-output-tokens 256 \
+  --max-tokens 5000 \
+  --thinking-mode no_think \
+  --prompt-format csv \
+  --resume
+```
+
+O comando valida o raw e cada filtragem antes de classificar. Cada fonte possui
+saída, checkpoint e métricas próprios; o raw fica em `classify/raw/` e o índice
+comparativo em `classify/<modelo_grande>/sources.json`.
+
+A classificação compacta `event_original_message`, remove `CallTrace`, GUIDs e duplicatas somente do contexto dos modelos grandes. Use `--thinking-mode think` ou `no_think` para experimentos separados; o modo faz parte do diretório, checkpoint e manifesto.
 
 Se parar, rode o mesmo comando com:
 
@@ -146,6 +173,13 @@ runs/<dataset>/filter/<modelo_pequeno>/
 runs/<dataset>/classify/<modelo_pequeno>/<modelo_grande>/
   classifications.jsonl
   checkpoint.json
+
+runs/<dataset>/classify/raw/<modelo_grande>/
+  classifications.jsonl
+  checkpoint.json
+
+runs/<dataset>/classify/<modelo_grande>/
+  sources.json
 ```
 
 - `extract`: dados extraídos do ZIP e segmentados por janela temporal. É opcional no
@@ -154,6 +188,8 @@ runs/<dataset>/classify/<modelo_pequeno>/<modelo_grande>/
   pequeno.
 - `filter`: saída do modelo pequeno, com decisão linha a linha e métricas da filtragem.
 - `classify`: saída dos modelos grandes, com decisão por segmento/ataque.
+- `classify/raw`: baseline sem filtragem, processada com o mesmo modelo grande e
+  protocolo da condição filtrada.
 
 Descrição dos arquivos:
 
@@ -199,9 +235,7 @@ CMAKE_ARGS="-DGGML_CUDA=on" uv sync --reinstall-package llama-cpp-python
 
 Por padrão o pipeline tenta descarregar todas as camadas na GPU
 (`--n-gpu-layers -1`). Ajuste `--n-ctx`, `--n-batch` e `--n-gpu-layers` conforme
-VRAM; use `--n-gpu-layers 0` para CPU. `--seed 2026`, `--warmup-runs 1`,
-`--inference-runs 1` e `--max-output-tokens 512` são os padrões reproduzíveis.
-Download, hash, carga, warm-up, hardware e parâmetros são registrados separadamente.
+VRAM; use `--n-gpu-layers 0` para CPU. O filtro mantém `n_ctx=4096` e até 512 tokens de saída; classificadores usam por padrão `n_ctx=8192`, uma pré-divisão aproximada de 5.000 tokens e uma verificação de tokens antes da chamada, reservando saída e margem de segurança. As respostas usam JSON estruturado (`response_format`) e erros de parsing, truncamento ou contexto ficam fora da matriz como não pontuados. `--seed 2026`, `--warmup-runs 1` e `--inference-runs 1` permanecem fixos. Download, hash, carga, warm-up, hardware, compactação, uso de tokens e modo de raciocínio são registrados separadamente.
 
 ## Métricas Estatísticas
 
@@ -338,7 +372,10 @@ uv run python scripts/comiset_llm_pipeline.py run-direct \
   --big-model Qwen/Qwen3-14B-GGUF:Qwen3-14B-Q4_K_M.gguf \
   --big-model bartowski/phi-4-GGUF:phi-4-Q4_K_M.gguf \
   --big-model bartowski/Mistral-Nemo-Instruct-2407-GGUF:Mistral-Nemo-Instruct-2407-Q4_K_M.gguf \
-  --max-tokens 1500 \
+  --max-tokens 5000 \
+  --classify-n-ctx 8192 \
+  --classify-max-output-tokens 256 \
+  --thinking-mode auto \
   --prompt-format csv
 ```
 
@@ -353,7 +390,10 @@ uv run python scripts/comiset_llm_pipeline.py run-direct \
   --big-model Qwen/Qwen3-14B-GGUF:Qwen3-14B-Q4_K_M.gguf \
   --big-model bartowski/phi-4-GGUF:phi-4-Q4_K_M.gguf \
   --big-model bartowski/Mistral-Nemo-Instruct-2407-GGUF:Mistral-Nemo-Instruct-2407-Q4_K_M.gguf \
-  --max-tokens 1500 \
+  --max-tokens 5000 \
+  --classify-n-ctx 8192 \
+  --classify-max-output-tokens 256 \
+  --thinking-mode auto \
   --prompt-format csv
 ```
 
@@ -379,13 +419,11 @@ runs/lab/filter/llama3.2_3b/checkpoint.json
 runs/lab/filter/llama3.2_3b/metrics.json
 runs/lab/filter/llama3.2_3b/metrics_by_segment.csv
 
-runs/lab/classify/llama3.2_3b/deepseek-r1_14b/classifications.jsonl
-runs/lab/classify/llama3.2_3b/qwen3_14b/classifications.jsonl
+runs/lab/classify/llama3.2_3b/deepseek-r1_14b_thinking-auto/classifications.jsonl
+runs/lab/classify/llama3.2_3b/qwen3_14b_thinking-no_think/classifications.jsonl
 ```
 
-O prompt usa CSV por padrão para economizar tokens. A classificação divide segmentos
-grandes em chunks de aproximadamente `--max-tokens` e consolida chunks válidos por
-maioria; erros se abstêm e empate resulta em `Not Interesting`.
+O prompt usa CSV por padrão para economizar tokens. Somente a classificação compacta a mensagem original e divide segmentos em chunks de aproximadamente `--max-tokens`; o cabeçalho CSV é contado uma vez por chunk. Chunks válidos são consolidados por maioria, erros se abstêm e empate resulta em `Not Interesting`. `/think` e `/no_think` são switches oficiais no Qwen3; no DeepSeek-R1 Distill são diretivas experimentais, não hard switches garantidos.
 
 ## 4. Extração Materializada Opcional
 
@@ -473,7 +511,10 @@ uv run python scripts/comiset_llm_pipeline.py run \
   --big-model Qwen/Qwen3-14B-GGUF:Qwen3-14B-Q4_K_M.gguf \
   --big-model bartowski/phi-4-GGUF:phi-4-Q4_K_M.gguf \
   --big-model bartowski/Mistral-Nemo-Instruct-2407-GGUF:Mistral-Nemo-Instruct-2407-Q4_K_M.gguf \
-  --max-tokens 1500 \
+  --max-tokens 5000 \
+  --classify-n-ctx 8192 \
+  --classify-max-output-tokens 256 \
+  --thinking-mode auto \
   --prompt-format csv
 ```
 
@@ -568,7 +609,10 @@ uv run python scripts/comiset_llm_pipeline.py classify \
   --output runs/lab/classify/llama3.2_3b/deepseek-r1_14b/classifications.jsonl \
   --checkpoint runs/lab/classify/llama3.2_3b/deepseek-r1_14b/checkpoint.json \
   --model bartowski/DeepSeek-R1-Distill-Qwen-14B-GGUF:DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf \
-  --max-tokens 1500 \
+  --max-tokens 5000 \
+  --n-ctx 8192 \
+  --max-output-tokens 256 \
+  --thinking-mode no_think \
   --prompt-format csv
 ```
 
@@ -590,4 +634,4 @@ Na extração, o checkpoint guarda a fase e a linha processada do JSONL interno.
 comprimido, retomar ainda exige descomprimir o fluxo até o ponto salvo, mas sem extrair
 o arquivo inteiro para disco.
 
-Na LLM, o checkpoint guarda a última linha filtrada ou o último segmento classificado.
+Na LLM, o checkpoint guarda a última linha filtrada ou o último segmento classificado. A classificação faz `flush()` antes do checkpoint e, na retomada, valida o JSONL e usa sua quantidade de registros duráveis como posição autoritativa.

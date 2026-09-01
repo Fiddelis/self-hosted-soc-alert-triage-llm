@@ -90,6 +90,7 @@ class LlamaCppGateway:
         n_batch: int,
         seed: int = 2026,
         max_output_tokens: int = 512,
+        structured_output: bool = True,
         logger: logging.Logger | None = None,
     ) -> None:
         self._n_ctx = n_ctx
@@ -97,8 +98,10 @@ class LlamaCppGateway:
         self._n_batch = n_batch
         self._seed = seed
         self._max_output_tokens = max_output_tokens
+        self._structured_output = structured_output
         self._models: dict[str, Any] = {}
         self._manifests: dict[str, dict[str, Any]] = {}
+        self._last_response_metadata: dict[str, Any] = {}
         self._logger = logger
 
     def _load(self, model: str) -> Any:
@@ -163,6 +166,7 @@ class LlamaCppGateway:
                 "n_batch": self._n_batch,
                 "seed": self._seed,
                 "max_output_tokens": self._max_output_tokens,
+                "structured_output": self._structured_output,
                 "temperature": 0,
             },
             "setup_timing": {
@@ -205,16 +209,40 @@ class LlamaCppGateway:
         timeout_seconds: int | None = None,
     ) -> str:
         del timeout_seconds  # In-process inference cannot be interrupted by the former HTTP timeout.
-        response = self._load(model).create_chat_completion(
-            messages=[
+        request = {
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0,
-            seed=self._seed,
-            max_tokens=self._max_output_tokens,
+            "temperature": 0,
+            "seed": self._seed,
+            "max_tokens": self._max_output_tokens,
+        }
+        if self._structured_output:
+            request["response_format"] = {"type": "json_object"}
+        response = self._load(model).create_chat_completion(
+            **request,
         )
         try:
-            return str(response["choices"][0]["message"]["content"] or "")
+            choice = response["choices"][0]
+            self._last_response_metadata = {
+                "finish_reason": choice.get("finish_reason"),
+                "usage": response.get("usage", {}),
+            }
+            return str(choice["message"]["content"] or "")
         except (IndexError, KeyError, TypeError) as exc:
             raise RuntimeError(f"Unexpected llama.cpp response shape: {response!r}") from exc
+
+    @property
+    def last_response_metadata(self) -> dict[str, Any]:
+        return dict(self._last_response_metadata)
+
+    def prompt_token_count(self, model: str, system_prompt: str, user_prompt: str) -> int:
+        """Conservatively count the prompt before reserving output tokens.
+
+        The chat template adds a small amount of model-specific overhead. Callers
+        reserve a safety margin in addition to this count before inference.
+        """
+        llm = self._load(model)
+        prompt = f"{system_prompt}\n{user_prompt}"
+        return len(llm.tokenize(prompt.encode("utf-8"), add_bos=True, special=True))

@@ -28,15 +28,31 @@ CSV_FIELDS = (
     "message",
 )
 
+CLASSIFICATION_CSV_FIELDS = tuple(field for field in CSV_FIELDS if field != "process_guid")
+CLASSIFICATION_MESSAGE_DROP_KEYS = {
+    "CallTrace",
+    "ProcessGuid",
+    "ProcessId",
+    "RuleName",
+    "SourceProcessGUID",
+    "SourceProcessId",
+    "SourceThreadId",
+    "TargetProcessGUID",
+    "UtcTime",
+}
+CLASSIFICATION_DETAIL_VALUE_LIMIT = 512
 
-def is_relevant(record: dict[str, Any]) -> bool:
+
+def is_relevant(record: dict[str, Any]) -> bool | None:
     result = record.get("filter_result", {})
+    if isinstance(result, dict) and (result.get("error") or result.get("parse_error")):
+        return None
     value = result.get("relevant")
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
         return value.strip().lower() in {"true", "yes", "relevant", "interesting"}
-    return False
+    return None
 
 
 def llm_event(record: dict[str, Any]) -> dict[str, Any]:
@@ -75,12 +91,37 @@ def event_to_csv_row(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def rows_to_csv(rows: list[dict[str, Any]]) -> str:
+def rows_to_csv(rows: list[dict[str, Any]], fieldnames: tuple[str, ...] = CSV_FIELDS) -> str:
     buffer = io.StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=CSV_FIELDS, extrasaction="ignore", lineterminator="\n")
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames, extrasaction="ignore", lineterminator="\n")
     writer.writeheader()
     writer.writerows(rows)
     return buffer.getvalue()
+
+
+def compact_classification_message(value: Any) -> str:
+    details = []
+    for raw_line in str(value or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if ": " in line:
+            key, detail = line.split(": ", 1)
+            if key in CLASSIFICATION_MESSAGE_DROP_KEYS or key.casefold().endswith("guid"):
+                continue
+            if len(detail) > CLASSIFICATION_DETAIL_VALUE_LIMIT:
+                detail = detail[:CLASSIFICATION_DETAIL_VALUE_LIMIT] + "…"
+            line = f"{key}={detail}"
+        elif len(line) > CLASSIFICATION_DETAIL_VALUE_LIMIT:
+            line = line[:CLASSIFICATION_DETAIL_VALUE_LIMIT] + "…"
+        details.append(line)
+    return "; ".join(details)
+
+
+def classification_event_to_csv_row(record: dict[str, Any]) -> dict[str, Any]:
+    row = event_to_csv_row(record)
+    row["message"] = compact_classification_message(row["message"])
+    return row
 
 
 def record_to_prompt_payload(record: dict[str, Any], prompt_format: str) -> str:
@@ -101,16 +142,24 @@ def approx_chunks(records: list[dict[str, Any]], max_tokens: int, prompt_format:
     max_chars = max_tokens * 4
     chunks: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
-    current_size = 0
+    if prompt_format == "csv":
+        header_size = len(rows_to_csv([], CLASSIFICATION_CSV_FIELDS))
+        current_size = header_size
+    else:
+        header_size = 2  # JSON list brackets.
+        current_size = header_size
     for record in records:
         if prompt_format == "csv":
-            item_size = len(rows_to_csv([event_to_csv_row(record)]))
+            item_size = len(rows_to_csv([classification_event_to_csv_row(record)], CLASSIFICATION_CSV_FIELDS))
+            item_size -= header_size
         else:
-            item_size = len(json.dumps(llm_event(record), ensure_ascii=False))
+            event = dict(llm_event(record))
+            event["event_original_message"] = compact_classification_message(event.get("event_original_message"))
+            item_size = len(json.dumps(event, ensure_ascii=False)) + 1
         if current and current_size + item_size > max_chars:
             chunks.append(current)
             current = []
-            current_size = 0
+            current_size = header_size
         current.append(record)
         current_size += item_size
     if current:
@@ -120,8 +169,16 @@ def approx_chunks(records: list[dict[str, Any]], max_tokens: int, prompt_format:
 
 def chunk_to_prompt_payload(records: list[dict[str, Any]], prompt_format: str) -> str:
     if prompt_format == "csv":
-        return rows_to_csv([event_to_csv_row(record) for record in records])
-    return json.dumps([llm_event(record) for record in records], ensure_ascii=False)
+        return rows_to_csv(
+            [classification_event_to_csv_row(record) for record in records],
+            CLASSIFICATION_CSV_FIELDS,
+        )
+    events = []
+    for record in records:
+        event = dict(llm_event(record))
+        event["event_original_message"] = compact_classification_message(event.get("event_original_message"))
+        events.append(event)
+    return json.dumps(events, ensure_ascii=False)
 
 
 def aggregate_chunk_results(chunks: list[dict[str, Any]], empty_segment: bool = False) -> dict[str, Any]:
@@ -190,4 +247,3 @@ def segment_technique_ids(record: dict[str, Any]) -> list[str]:
     if isinstance(values, str):
         return [values]
     return [str(value) for value in values]
-

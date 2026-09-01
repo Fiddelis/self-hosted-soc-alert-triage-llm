@@ -356,6 +356,8 @@ def classify_report(input_path: Path, output_dir: Path) -> dict[str, str]:
     inference_errors = 0
     processed = 0
     total_chunks = 0
+    source = None
+    filter_model = None
 
     with input_path.open(encoding="utf-8") as src:
         for raw_line in src:
@@ -367,6 +369,9 @@ def classify_report(input_path: Path, output_dir: Path) -> dict[str, str]:
             if outcome in counts:
                 counts[outcome] += 1
             result = record.get("classification_result", {})
+            if isinstance(result, dict):
+                source = result.get("source", source)
+                filter_model = result.get("filter_model", filter_model)
             chunks = result.get("chunks", []) if isinstance(result, dict) else []
             total_chunks += len(chunks)
             chunk_elapsed = [
@@ -411,6 +416,8 @@ def classify_report(input_path: Path, output_dir: Path) -> dict[str, str]:
     metrics = {
         **confusion_metrics(counts["tp"], counts["fp"], counts["fn"], counts["tn"]),
         "input": str(input_path),
+        "source": source,
+        "filter_model": filter_model,
         "processed_segments": processed,
         "processed_chunks": total_chunks,
         "scored_segments": sum(counts.values()),
